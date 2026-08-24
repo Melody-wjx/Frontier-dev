@@ -17,6 +17,7 @@ SYS_ARCH: str = None
 USE_CUDA_GRAPH: bool = False
 CUDAGRAPH_CAPTURE_SIZES: Optional[list[int]] = None
 DECODE_CUDA_GRAPH_MODE: str = "none"
+DECODE_STEP_WALL_TABLE_FILE: str = ""
 ALLOW_SPEC_DECODE_CUDA_GRAPH_DIAGNOSTIC: bool = False
 ENABLE_MONOLITHIC_MOE_STAGE_AGGREGATION: bool = False
 QUANTIZATION_MANAGER = None
@@ -79,6 +80,22 @@ def get_cudagraph_capture_sizes() -> Optional[list[int]]:
 def get_decode_cuda_graph_mode() -> str:
     """Get decode-only CUDA Graph mode for non-AFD paths."""
     return DECODE_CUDA_GRAPH_MODE
+
+
+def set_decode_step_wall_table_file(path: str) -> None:
+    """Set the optional decode step-wall table path (SwiftMind extension).
+
+    When set, pure decode batches that hit the CUDA Graph capture ladder are
+    timed directly from measured engine-step wall times instead of the
+    per-operator composition.
+    """
+    global DECODE_STEP_WALL_TABLE_FILE
+    DECODE_STEP_WALL_TABLE_FILE = path or ""
+
+
+def get_decode_step_wall_table_file() -> str:
+    """Get the optional decode step-wall table path ("" when disabled)."""
+    return DECODE_STEP_WALL_TABLE_FILE
 
 
 def get_allow_spec_decode_cuda_graph_diagnostic() -> bool:

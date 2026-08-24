@@ -584,9 +584,28 @@ class QuantizationManager:
         predicted_time: float,
         cluster_type: Optional[ClusterType] = None,
     ) -> float:
+        # The per-(operation, cluster) adjustment mode is derived entirely from
+        # static quantization configuration, so resolve it once and cache it.
+        # The first resolution still runs the full path (including the
+        # one-shot mismatch warning), preserving observable behavior.
+        cache = getattr(self, "_compute_time_adjustment_cache", None)
+        if cache is None:
+            cache = {}
+            self._compute_time_adjustment_cache = cache
+        cache_key = (operation_name, cluster_type)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            mode, factor = cached
+            if mode == 0:
+                return predicted_time
+            if mode == 1:
+                return predicted_time / factor
+            return predicted_time * factor
+
         if operation_name in self._operation_speedup_factors:
             speedup = self._operation_speedup_factors[operation_name]
             adjusted = predicted_time / speedup
+            cache[cache_key] = (1, speedup)
             logger.debug(
                 "Compute time adjustment (speedup): op=%s original=%.6f adjusted=%.6f factor=%.4f",
                 operation_name,
@@ -597,6 +616,7 @@ class QuantizationManager:
             return adjusted
 
         if not self.has_precision_mismatch(operation_name, cluster_type):
+            cache[cache_key] = (0, 1.0)
             return predicted_time
 
         precision = self.get_precision(operation_name, cluster_type)
@@ -604,6 +624,7 @@ class QuantizationManager:
         scaling = precision.get_compute_scaling_factor(profiling_precision)
         adjusted = predicted_time * scaling
         self.check_and_warn_mismatch(operation_name, cluster_type)
+        cache[cache_key] = (2, scaling)
         logger.debug(
             "Compute time adjustment (scaling): op=%s original=%.6f adjusted=%.6f scaling=%.4f",
             operation_name,

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Tuple, Dict, List, Optional, Sequence
 from collections import defaultdict
+import logging
 
 from frontier.entities.base_entity import BaseEntity
 from frontier.logger import init_logger
@@ -1268,14 +1269,15 @@ class Request(BaseEntity):
                 self._completed_layer_count = 0
                 self._current_decode_token_index += committed_tokens
                 self._spec_last_committed_tokens = committed_tokens
-                logger.info(
-                    f"[TOKEN-ROLLOUT] req={self._id} cluster={cluster_type.name} "
-                    f"decode_progress={self.num_processed_decode_tokens}/{self._num_decode_tokens} "
-                    f"total_progress={self._num_processed_tokens}/{self.total_tokens} "
-                    f"committed_tokens={committed_tokens} "
-                    f"num_prefill_tokens={self._num_prefill_tokens} "
-                    f"num_decode_tokens={self._num_decode_tokens} "
-                )
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        f"[TOKEN-ROLLOUT] req={self._id} cluster={cluster_type.name} "
+                        f"decode_progress={self.num_processed_decode_tokens}/{self._num_decode_tokens} "
+                        f"total_progress={self._num_processed_tokens}/{self.total_tokens} "
+                        f"committed_tokens={committed_tokens} "
+                        f"num_prefill_tokens={self._num_prefill_tokens} "
+                        f"num_decode_tokens={self._num_decode_tokens} "
+                    )
 
         # MONOLITHIC cluster: rollout decode token whenever prefill is already
         # complete (including the callback that completes prefill). This matches

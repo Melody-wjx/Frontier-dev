@@ -879,7 +879,12 @@ class VidurCCBackend(BaseCCBackend):
             )
             return max(0.0, result)
 
-        # Fallback to analytical if not in cache
+        # Key outside the pre-generated grid: query the trained model
+        # directly (memoized); analytical model only when no trained
+        # model is available.
+        result = self._predict_out_of_grid("all_reduce", num_tokens)
+        if result is not None:
+            return result
         logger.debug(f"num_tokens={num_tokens} not in cache, using analytical fallback")
         return self._analytical_fallback_allreduce(data_size_bytes, num_devices)
 
@@ -929,9 +934,103 @@ class VidurCCBackend(BaseCCBackend):
             )
             return max(0.0, result)
 
-        # Fallback to analytical if not in cache
+        # Key outside the pre-generated grid: query the trained model
+        # directly (memoized); analytical model only when no trained
+        # model is available.
+        result = self._predict_out_of_grid("send_recv", num_tokens)
+        if result is not None:
+            return result
         logger.debug(f"num_tokens={num_tokens} not in cache, using analytical fallback")
         return self._analytical_fallback_send_recv(data_size_bytes)
+
+    # Upper bound for the lazy out-of-grid extension grid (num_tokens units,
+    # i.e. BF16 elements). 64M elements = 128MB, well above any realistic
+    # collective buffer; tree models extrapolate flatly beyond their training
+    # range, so overshooting the training maximum is harmless.
+    _OUT_OF_GRID_EXTENSION_HI = 64 * 1024 * 1024
+    # Relative spacing of the extension grid; interpolation error is bounded
+    # by the spacing, far below measurement noise.
+    _OUT_OF_GRID_EXTENSION_STEP = 0.002
+
+    def _build_out_of_grid_extension(self, model_name: str):
+        """Lazily batch-predict a geometric grid above the pre-generated
+        1..100000 lookup table. One vectorized predict of ~4k rows costs
+        ~15ms, versus ~3ms per single-row sklearn predict call."""
+        with self._cache_lock:
+            model = self._models.get(model_name)
+        if model is None:
+            return None
+        grid = np.unique(
+            np.geomspace(
+                100001, self._OUT_OF_GRID_EXTENSION_HI, num=4096
+            ).astype(np.int64)
+        )
+        values = model.predict(pd.DataFrame({"num_tokens": grid}))
+        values = np.maximum(values.astype(np.float64), 0.0)
+        return grid, values
+
+    def _predict_out_of_grid(self, model_name: str, num_tokens: int) -> Optional[float]:
+        """Predict with the trained sklearn model for keys outside the
+        pre-generated grid, memoizing the result into the predictions cache.
+
+        The pre-generated lookup grid only covers num_tokens 1..100000, but the
+        runtime key is embedding_dim * tokens (i.e. the BF16 element count of
+        the collective buffer), so most realistic batch sizes fall outside the
+        grid. A lazily built geometric extension grid plus linear
+        interpolation answers these queries from the measured-data model,
+        which is far more accurate than the analytical fallback whose default
+        bandwidth assumes NVLink (600 Gbps).
+
+        Returns None when no trained model is available (caller should then
+        use the analytical fallback).
+        """
+        extensions = getattr(self, "_out_of_grid_extensions", None)
+        if extensions is None:
+            extensions = {}
+            self._out_of_grid_extensions = extensions
+        extension = extensions.get(model_name)
+        if extension is None:
+            with self._cache_lock:
+                if not self._predictions.get(model_name):
+                    return None
+            extension = self._build_out_of_grid_extension(model_name)
+            if extension is None:
+                return None
+            extensions[model_name] = extension
+
+            warned = getattr(self, "_out_of_grid_warned_models", None)
+            if warned is None:
+                warned = set()
+                self._out_of_grid_warned_models = warned
+            if model_name not in warned:
+                warned.add(model_name)
+                logger.warning(
+                    f"{model_name}: runtime num_tokens key exceeds the pre-generated "
+                    f"prediction grid (max 100000); using a lazily built "
+                    f"geometric extension grid with interpolation for "
+                    f"out-of-grid keys."
+                )
+
+        grid, values = extension
+        idx = int(np.searchsorted(grid, num_tokens))
+        if idx <= 0:
+            result = float(values[0])
+        elif idx >= len(grid):
+            result = float(values[-1])
+        else:
+            lo, hi = grid[idx - 1], grid[idx]
+            frac = (num_tokens - lo) / (hi - lo)
+            result = float(values[idx - 1] + frac * (values[idx] - values[idx - 1]))
+        result = max(0.0, result)
+        with self._cache_lock:
+            predictions_cache = self._predictions.get(model_name)
+            if predictions_cache is not None:
+                predictions_cache[(num_tokens,)] = result
+        logger.debug(
+            f"{model_name}: on-demand prediction for out-of-grid "
+            f"num_tokens={num_tokens}, result={result:.6f} ms"
+        )
+        return result
 
     def predict_allgather(
         self,

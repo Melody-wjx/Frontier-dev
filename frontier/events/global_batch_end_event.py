@@ -1,5 +1,7 @@
 from typing import List
 
+import logging
+
 from frontier.events.base_event import BaseEvent
 from frontier.types import EventType, ClusterType
 from frontier.scheduler import BaseGlobalScheduler, BaseClusterScheduler, BaseReplicaScheduler
@@ -107,16 +109,17 @@ class GlobalBatchEndEvent(BaseEvent):
             return []
 
         # Debug: entering GlobalBatchEndEvent with batch/request states
-        try:
-            req_states = [
-                f"id={r.id}|tok={getattr(r,'current_decode_token_index',None)}|layer={getattr(r,'completed_layer_count',None)}"
-                for r in self._batch.requests
-            ]
-            logger.info(
-                f"[GLOBAL-END][ENTER] batch={getattr(self._batch,'id','?')} replica={self._replica_id} dp={self._dp_id} reqs={req_states}"
-            )
-        except Exception as e:
-            logger.debug(f"[GLOBAL-END][ENTER] logging failed: {e}")
+        if logger.isEnabledFor(logging.INFO):
+            try:
+                req_states = [
+                    f"id={r.id}|tok={getattr(r,'current_decode_token_index',None)}|layer={getattr(r,'completed_layer_count',None)}"
+                    for r in self._batch.requests
+                ]
+                logger.info(
+                    f"[GLOBAL-END][ENTER] batch={getattr(self._batch,'id','?')} replica={self._replica_id} dp={self._dp_id} reqs={req_states}"
+                )
+            except Exception as e:
+                logger.debug(f"[GLOBAL-END][ENTER] logging failed: {e}")
 
         def _current_request_entries() -> list[tuple[int, object]]:
             current_entries: list[tuple[int, object]] = []
@@ -125,12 +128,12 @@ class GlobalBatchEndEvent(BaseEvent):
                 if request.id in seen_request_ids:
                     continue
                 seen_request_ids.add(request.id)
-                current_execution_signature = Batch._get_request_execution_signature(
-                    request
-                )
+                # Mutation signature embeds the execution signature as its
+                # first three elements; compute it once and slice.
                 current_mutation_signature = Batch._get_request_mutation_signature(
                     request
                 )
+                current_execution_signature = current_mutation_signature[:3]
                 if (
                     current_execution_signature
                     == self._request_execution_signatures[index]

@@ -1058,10 +1058,13 @@ class Batch(BaseEntity):
         seen_request_ids = set()
         for idx, (request, num_tokens) in enumerate(zip(self._requests, self._num_tokens)):
             if request.id not in seen_request_ids:
-                expected_execution_signature = expected_execution_signatures[idx]
-                current_execution_signature = self._get_request_execution_signature(
+                # Mutation signature embeds the execution signature as its
+                # first three elements; compute it once and slice.
+                current_mutation_signature = self._get_request_mutation_signature(
                     request
                 )
+                current_execution_signature = current_mutation_signature[:3]
+                expected_execution_signature = expected_execution_signatures[idx]
                 if current_execution_signature != expected_execution_signature:
                     logger.warning(
                         "[STALE-BATCH-END] Skipping request mutation for batch=%s req=%s "
@@ -1074,9 +1077,6 @@ class Batch(BaseEntity):
                     seen_request_ids.add(request.id)
                     continue
                 expected_mutation_signature = expected_mutation_signatures[idx]
-                current_mutation_signature = self._get_request_mutation_signature(
-                    request
-                )
                 if current_mutation_signature != expected_mutation_signature:
                     logger.warning(
                         "[STALE-BATCH-END-PROGRESS] Skipping request mutation for "

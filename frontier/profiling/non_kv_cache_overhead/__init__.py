@@ -25,13 +25,27 @@ from frontier.profiling.non_kv_cache_overhead.runner import (
     SingleRankProfileOutput,
     run_single_rank_profile,
 )
-from frontier.profiling.non_kv_cache_overhead.runtime_estimator import (
-    RuntimeNonKVProfileResult,
-    clear_runtime_non_kv_cache_overhead_cache,
-    estimate_non_kv_cache_overhead_bytes,
-    estimate_non_kv_cache_profile,
-)
 from frontier.profiling.non_kv_cache_overhead.types import NonKVMemoryBreakdown
+
+# runtime_estimator pulls in the vLLM-backed profiling stack (seconds of
+# import time). Defer it to first attribute access so that light consumers
+# (e.g. the disk cache, the NCCL estimator) do not pay that cost.
+_RUNTIME_ESTIMATOR_EXPORTS = {
+    "RuntimeNonKVProfileResult",
+    "clear_runtime_non_kv_cache_overhead_cache",
+    "estimate_non_kv_cache_overhead_bytes",
+    "estimate_non_kv_cache_profile",
+}
+
+
+def __getattr__(name: str):
+    if name in _RUNTIME_ESTIMATOR_EXPORTS:
+        from frontier.profiling.non_kv_cache_overhead import runtime_estimator
+
+        return getattr(runtime_estimator, name)
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
+    )
 
 __all__ = [
     "GPUComputeProcess",

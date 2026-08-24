@@ -4,6 +4,9 @@
 
 | Date       | Summary of Changes |
 |------------|--------------------|
+| 2026-08-21 | Kept the optional `decode_step_wall_table_file` switch (schema `swiftmind.frontier.decode_step_wall_table.v1`): graph-captured pure decode batches can be timed from measured vLLM engine-step wall tables with kv-anchor attention correction; default `""` keeps it off. A sibling mixed-batch step-wall override was evaluated on 8 workloads and fully reverted (bidirectional overcorrection on high-concurrency agentic traces). |
+| 2026-08-20 | Track A D1: Vidur cc backend out-of-grid keys (num_tokens > 100000) now use a lazily built geometric extension grid with vectorized batch predict + linear interpolation instead of silently falling back to the 600 Gbps NVLink analytical model (vidur_cc_backend.py). agentic500 E2E MAPE 26.98→4.54; no wall-clock regression. |
+| 2026-08-20 | Track S hot-path speedups (lazy/guarded logging, KV allocation dedup, loop-invariant hoisting, quant-factor and CPU-feature memoization, ExecutionTime init deepcopy elimination, batch signature dedup); bit-exact vs prior outputs. |
 | 2026-08-09 | Restored the sequential-only public PDD guard and documented current post-ISSUE-022 slowdown evidence. |
 | 2026-08-08 | Clarified that parallel PDD preserves sequential-DES correctness without promising wall-clock speedup. |
 | 2026-08-07 | Corrected the PDD parallel runtime contract while retaining sequential public examples and the PD-AF parallel guard. |

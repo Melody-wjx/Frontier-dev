@@ -111,6 +111,10 @@ class ExecutionTime(BaseEntity):
             moe_operator_times,
             communication_operator_times,
         )
+        attention_provided = attention_operator_times is not None
+        moe_provided = moe_operator_times is not None
+        mlp_provided = mlp_operator_times is not None
+        communication_provided = communication_operator_times is not None
         if attention_operator_times is None:
             attention_operator_times = build_attention_operator_times_from_op_times(
                 merged_op_times
@@ -126,10 +130,17 @@ class ExecutionTime(BaseEntity):
             communication_operator_times = (
                 build_communication_operator_times_from_op_times(merged_op_times)
             )
-        attention_operator_times = deepcopy(attention_operator_times)
-        mlp_operator_times = deepcopy(mlp_operator_times)
-        moe_operator_times = deepcopy(moe_operator_times)
-        communication_operator_times = deepcopy(communication_operator_times)
+        # Defensive copies are only needed for caller-provided objects;
+        # internally built operator-time objects are freshly created above and
+        # owned exclusively by this instance.
+        if attention_provided:
+            attention_operator_times = deepcopy(attention_operator_times)
+        if mlp_provided:
+            mlp_operator_times = deepcopy(mlp_operator_times)
+        if moe_provided:
+            moe_operator_times = deepcopy(moe_operator_times)
+        if communication_provided:
+            communication_operator_times = deepcopy(communication_operator_times)
 
         op_time_attr_values = execution_op_time_values_by_attr(merged_op_times)
 

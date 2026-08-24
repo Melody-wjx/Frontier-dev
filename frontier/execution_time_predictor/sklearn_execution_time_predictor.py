@@ -1,7 +1,9 @@
 import ast
+import atexit
 import copy
 import hashlib
 import json
+import logging
 import os
 import pickle
 from abc import abstractmethod
@@ -136,6 +138,56 @@ def _build_exact_feature_lookup(
         key_tuple = key if isinstance(key, tuple) else (key,)
         lookup[tuple(float(item) for item in key_tuple)] = float(value)
     return lookup
+
+
+class _LazyCachedModel:
+    """Deferred-loading proxy for a pickled sklearn estimator.
+
+    Cache loads dominate predictor startup (multi-GB pickle files on slow
+    filesystems), while warm runs typically resolve every query from
+    prediction caches and never call ``model.predict``. This proxy carries
+    the metadata Frontier needs at init (model hash, feature names, feature
+    count) without unpickling; the real estimator is loaded under the same
+    inter-process read lock on first actual use (``predict``/attribute
+    access). Numerical behavior is identical: any code path that needs the
+    estimator receives the same object the eager loader would have returned.
+    """
+
+    def __init__(
+        self,
+        cache_file: str,
+        lock_file: str,
+        model_hash: str,
+        feature_names: List[str],
+    ) -> None:
+        self._cache_file = cache_file
+        self._lock_file = lock_file
+        self._frontier_model_hash = model_hash
+        self._frontier_feature_names = list(feature_names)
+        self._real_model: Optional[BaseEstimator] = None
+
+    @property
+    def n_features_in_(self) -> int:
+        if self._real_model is not None:
+            return self._real_model.n_features_in_
+        return len(self._frontier_feature_names)
+
+    def _get_real_model(self) -> BaseEstimator:
+        if self._real_model is None:
+            with InterProcessReaderWriterLock(self._lock_file).read_lock():
+                with open(self._cache_file, "rb") as f:
+                    self._real_model = pickle.load(f)
+        return self._real_model
+
+    def predict(self, X):
+        return self._get_real_model().predict(X)
+
+    def __getattr__(self, name: str):
+        # Only called when normal lookup fails. Never delegate dunder or
+        # proxy-private names; those must resolve (or fail) on the proxy.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._get_real_model(), name)
 
 
 if TYPE_CHECKING:
@@ -419,6 +471,19 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._runtime_cache: Dict[str, Dict[str, Dict[tuple, float]]] = defaultdict(
             lambda: defaultdict(dict)
         )
+        # Fast RandomForest predict path state: (family_name, model_name) ->
+        # list of tree_ objects (validated) or None (fast path disabled).
+        # The family must be part of the key because the same model_name
+        # exists with different estimators under different families
+        # (e.g. eager vs kernel_only).
+        self._rf_fast_trees: Dict[tuple, Optional[list]] = {}
+        # Cross-run cache for on-demand predictions, keyed by
+        # (measurement family, model name, model hash) so stale entries are
+        # never reused after the underlying estimator changes.
+        self._persisted_on_demand_cache: Dict[tuple, Dict[tuple, float]] = {}
+        if not self._enable_dummy_mode and not getattr(self._config, "no_cache", False):
+            self._load_persisted_on_demand_cache()
+            atexit.register(self._save_persisted_on_demand_cache)
         self._activate_measurement_type(self._get_default_measurement_type_for_cluster())
 
 
@@ -2752,6 +2817,33 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             model = pickle.load(open(cache_file, "rb"))
             return model
 
+    def _load_model_from_cache_lazy(
+        self, model_name: str, model_hash: str, feature_cols: List[str]
+    ) -> Optional[BaseEstimator]:
+        """Return a deferred-loading proxy for the cached model, if present.
+
+        Existence/lock/no_cache semantics match _load_model_from_cache, but
+        the (potentially multi-GB) estimator pickle is only read when a code
+        path actually invokes the model. This keeps warm-run startup fast
+        without changing any numerical behavior.
+        """
+        with InterProcessReaderWriterLock(
+            f"{self._cache_dir}/{model_hash}_model_lock.file"
+        ).read_lock():
+            if self._config.no_cache:
+                return None
+            cache_file = f"{self._cache_dir}/{model_name}_{model_hash}.pkl"
+            if not os.path.exists(cache_file):
+                return None
+
+            logger.debug(f"Found model {model_name} in cache (deferred load)")
+            return _LazyCachedModel(
+                cache_file=cache_file,
+                lock_file=f"{self._cache_dir}/{model_hash}_model_lock.file",
+                model_hash=model_hash,
+                feature_names=feature_cols,
+            )
+
     def _store_model_in_cache(
         self, model_name: str, model_hash: str, model: BaseEstimator
     ) -> None:
@@ -2813,8 +2905,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         model_hash = self._get_model_hash(model_name, df)
 
-        cached_model = self._load_model_from_cache(model_name, model_hash)
-        if cached_model:
+        cached_model = self._load_model_from_cache_lazy(
+            model_name, model_hash, feature_cols
+        )
+        if cached_model is not None:
             return cached_model
 
         model = self._get_estimator()
@@ -2868,12 +2962,21 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         with InterProcessReaderWriterLock(
             f"{self._cache_dir}/{prediction_hash}_prediction_lock.file"
         ).write_lock():
-            cache_file = (
-                f"{self._cache_dir}/{model_name}_{prediction_hash}_predictions.pkl"
+            # Store as parallel float64 arrays instead of a pickled dict:
+            # multi-million-entry dicts of tuple keys are ~2.5x larger and
+            # ~3x slower to deserialize than this array round-trip.
+            npz_file = (
+                f"{self._cache_dir}/{model_name}_{prediction_hash}_predictions.npz"
             )
-            pickle.dump(
-                predictions, open(cache_file, "wb"), protocol=pickle.HIGHEST_PROTOCOL
-            )
+            if predictions:
+                keys = np.asarray(list(predictions.keys()), dtype=np.float64)
+                vals = np.fromiter(
+                    predictions.values(), dtype=np.float64, count=len(predictions)
+                )
+            else:
+                keys = np.empty((0, 0), dtype=np.float64)
+                vals = np.empty((0,), dtype=np.float64)
+            np.savez(npz_file, keys=keys, vals=vals)
 
     def _load_model_predication_cache(
         self, model_name: str, prediction_hash: str
@@ -2883,17 +2986,38 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ).read_lock():
             if self._config.no_cache:
                 return None
-            cache_file = (
+            npz_file = (
+                f"{self._cache_dir}/{model_name}_{prediction_hash}_predictions.npz"
+            )
+            pkl_file = (
                 f"{self._cache_dir}/{model_name}_{prediction_hash}_predictions.pkl"
             )
 
-            if not os.path.exists(cache_file):
+            if os.path.exists(npz_file):
+                logger.debug(f"Found model {model_name} predictions in cache (npz)")
+                archive = np.load(npz_file)
+                keys, vals = archive["keys"], archive["vals"]
+                if keys.size == 0:
+                    return {}
+                return dict(zip(map(tuple, keys.tolist()), vals.tolist()))
+
+            if not os.path.exists(pkl_file):
                 return None
 
             logger.debug(f"Found model {model_name} predictions in cache")
 
-            predictions = pickle.load(open(cache_file, "rb"))
-            return predictions
+            predictions = pickle.load(open(pkl_file, "rb"))
+
+        # Best-effort self-migration to the npz format for subsequent runs.
+        # Done outside the read lock; the store path takes the write lock.
+        try:
+            if not os.path.exists(npz_file):
+                self._store_model_predication_cache(
+                    model_name, prediction_hash, predictions
+                )
+        except Exception:
+            pass
+        return predictions
 
     def _get_prediction_cache_hash(self, model_name: str, model: BaseEstimator) -> str:
         """
@@ -4136,6 +4260,143 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         batch._decode_mixed_features = features
         return features
 
+    def _on_demand_cache_file(self) -> str:
+        return os.path.join(self._cache_dir, "on_demand_runtime_cache.pkl")
+
+    def _load_persisted_on_demand_cache(self) -> None:
+        cache_file = self._on_demand_cache_file()
+        if not os.path.exists(cache_file):
+            return
+        try:
+            with open(cache_file, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict):
+                self._persisted_on_demand_cache = data
+                total = sum(len(v) for v in data.values())
+                logger.info(
+                    f"Loaded {total} persisted on-demand predictions from {cache_file}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to load persisted on-demand cache {cache_file}: {e}"
+            )
+
+    def _save_persisted_on_demand_cache(self) -> None:
+        if not self._persisted_on_demand_cache:
+            return
+        cache_file = self._on_demand_cache_file()
+        tmp_file = f"{cache_file}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_file, "wb") as f:
+                pickle.dump(
+                    self._persisted_on_demand_cache, f, protocol=pickle.HIGHEST_PROTOCOL
+                )
+            os.replace(tmp_file, cache_file)
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist on-demand cache {cache_file}: {e}"
+            )
+
+    def _lookup_persisted_on_demand(
+        self, family_name: str, model_name: str, model: Optional[BaseEstimator], cache_key: tuple
+    ) -> Optional[float]:
+        model_hash = getattr(model, "_frontier_model_hash", None) if model is not None else None
+        if model_hash is None:
+            return None
+        model_cache = self._persisted_on_demand_cache.get(
+            (family_name, model_name, model_hash)
+        )
+        if model_cache is None:
+            return None
+        return model_cache.get(cache_key)
+
+    def _persist_on_demand_value(
+        self,
+        family_name: str,
+        model_name: str,
+        model: Optional[BaseEstimator],
+        cache_key: tuple,
+        prediction: float,
+    ) -> None:
+        model_hash = getattr(model, "_frontier_model_hash", None) if model is not None else None
+        if model_hash is None:
+            return
+        self._persisted_on_demand_cache.setdefault(
+            (family_name, model_name, model_hash), {}
+        )[cache_key] = prediction
+
+    def _rf_fast_predict(
+        self,
+        family_name: str,
+        model_name: str,
+        model: BaseEstimator,
+        feature_values: List[float],
+        feature_names: List[str],
+    ) -> Optional[float]:
+        """
+        Fast RandomForestRegressor prediction that bypasses pandas DataFrame
+        construction and joblib/warnings per-call overhead by invoking the
+        underlying trees directly.
+
+        On first use per model the fast path is validated numerically against
+        the standard sklearn predict path; if they disagree (or anything
+        fails), the fast path is disabled for that model and None is returned
+        so the caller falls back to the standard path.
+
+        Note: the same model_name exists under multiple measurement families
+        (e.g. eager vs kernel_only) with different trained estimators, so all
+        fast-path state is keyed by (family_name, model_name).
+
+        Returns:
+            Prediction value, or None when the fast path is unavailable.
+        """
+        from sklearn.ensemble import RandomForestRegressor
+
+        if isinstance(model, _LazyCachedModel):
+            # Trigger the deferred load once; afterwards the cached tree list
+            # is keyed by fast_key and the model object is no longer touched.
+            model = model._get_real_model()
+
+        if not isinstance(model, RandomForestRegressor):
+            return None
+
+        fast_key = (family_name, model_name)
+
+        if fast_key not in self._rf_fast_trees:
+            try:
+                candidate = [tree.tree_ for tree in model.estimators_]
+                x = np.asarray(feature_values, dtype=np.float32).reshape(1, -1)
+                fast = float(
+                    np.fromiter(
+                        (tree.predict(x)[0, 0] for tree in candidate),
+                        dtype=np.float64,
+                        count=len(candidate),
+                    ).mean()
+                )
+                reference = float(
+                    model.predict(pd.DataFrame([feature_values], columns=feature_names))[0]
+                )
+                tolerance = max(1e-12, abs(reference) * 1e-12)
+                valid = np.isfinite(fast) and abs(fast - reference) <= tolerance
+            except Exception:
+                candidate, valid = None, False
+            self._rf_fast_trees[fast_key] = candidate if valid else None
+            if not valid:
+                return None
+            return fast
+
+        trees = self._rf_fast_trees[fast_key]
+        if trees is None:
+            return None
+        x = np.asarray(feature_values, dtype=np.float32).reshape(1, -1)
+        return float(
+            np.fromiter(
+                (tree.predict(x)[0, 0] for tree in trees),
+                dtype=np.float64,
+                count=len(trees),
+            ).mean()
+        )
+
     def _get_on_demand_prediction(
         self, model_name: str, features: Dict[str, float]
     ) -> float:
@@ -4198,21 +4459,42 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if model is None:
             raise ValueError(f"Model {model_name} has no trained model available")
 
-        feature_vector = pd.DataFrame(
-            [[features[fn] for fn in feature_names]],
-            columns=feature_names,
+        # Cross-run cache hit: value is a pure function of (model, features),
+        # keyed by model hash so stale entries can never be reused.
+        persisted = self._lookup_persisted_on_demand(
+            family_name, model_name, model, cache_key
         )
+        if persisted is not None:
+            self._runtime_cache[family_name][model_name][cache_key] = persisted
+            return persisted
 
-        # Make prediction
-        try:
-            prediction = float(model.predict(feature_vector)[0])
-            # Ensure non-negative prediction
-            prediction = max(0.0, prediction)
-        except Exception as e:
-            raise ValueError(f"On-demand prediction failed for {model_name}: {e}")
+        feature_values = [float(features[fn]) for fn in feature_names]
+
+        # Fast path for RandomForest models (numerically self-validated on
+        # first use); falls back to the standard sklearn predict path.
+        prediction = self._rf_fast_predict(
+            family_name, model_name, model, feature_values, feature_names
+        )
+        if prediction is None:
+            feature_vector = pd.DataFrame(
+                [feature_values],
+                columns=feature_names,
+            )
+
+            # Make prediction
+            try:
+                prediction = float(model.predict(feature_vector)[0])
+            except Exception as e:
+                raise ValueError(f"On-demand prediction failed for {model_name}: {e}")
+
+        # Ensure non-negative prediction
+        prediction = max(0.0, prediction)
 
         # Cache the result
         self._runtime_cache[family_name][model_name][cache_key] = prediction
+        self._persist_on_demand_value(
+            family_name, model_name, model, cache_key, prediction
+        )
 
         return prediction
 
@@ -5288,8 +5570,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         # Log the valid prediction for debugging
         logger.debug(
-            f"[EXEC_TIME_VALID] {operation_name}: {value:.6f}ms "
-            f"(batch_id={batch.id}, tokens={batch.num_tokens})"
+            "[EXEC_TIME_VALID] %s: %.6fms (batch_id=%s, tokens=%s)",
+            operation_name,
+            value,
+            batch.id,
+            batch.num_tokens,
         )
 
         return value
@@ -5337,8 +5622,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 comm_domain="ATTN_TP",
             )
             logger.debug(
-                f"_get_tensor_parallel_communication_time: using CC Backend, "
-                f"data_size={data_size_bytes}, num_devices={num_devices}, result={result:.6f} ms"
+                "_get_tensor_parallel_communication_time: using CC Backend, "
+                "data_size=%s, num_devices=%s, result=%.6f ms",
+                data_size_bytes,
+                num_devices,
+                result,
             )
             return result
 
@@ -5548,6 +5836,178 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "_attn_kv_cache_save_calibration_scale",
             "attn_kv_cache_save_calibration_scale",
         )
+
+    # ------------------------------------------------------------------
+    # SwiftMind decode step-wall table override (measured full-step timing)
+    # ------------------------------------------------------------------
+
+    def _get_decode_step_wall_table(self) -> Optional[dict]:
+        """Lazily load the decode step-wall table built from vLLM grid capture.
+
+        Returns {"sizes": [int...], "walls_ms": [float...], "anchor_kv": int}
+        or None when the feature is disabled / the artifact is missing.
+        """
+        if getattr(self, "_decode_step_wall_table_loaded", False):
+            return self._decode_step_wall_table
+        self._decode_step_wall_table_loaded = True
+        self._decode_step_wall_table = None
+
+        path = global_vars.get_decode_step_wall_table_file()
+        if not path:
+            return None
+        if not os.path.isfile(path):
+            raise ValueError(
+                f"decode_step_wall_table_file not found: {path}"
+            )
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("schema") != "swiftmind.frontier.decode_step_wall_table.v1":
+            raise ValueError(
+                f"unsupported decode step-wall table schema in {path}: "
+                f"{payload.get('schema')!r}"
+            )
+        entries = payload["entries"]
+        self._decode_step_wall_table = {
+            "sizes": [int(e["batch_size"]) for e in entries],
+            "walls_ms": [float(e["wall_ms"]) for e in entries],
+            "anchor_kv": int(payload["anchor_kv_cache_size"]),
+        }
+        logger.info(
+            "[DECODE_STEP_WALL] loaded %d batch-size entries from %s",
+            len(entries),
+            path,
+        )
+        return self._decode_step_wall_table
+
+    @staticmethod
+    def _interp_step_wall(sizes: List[int], walls_ms: List[float], batch_size: int):
+        """Linear interpolation over measured (batch_size -> wall_ms) points.
+
+        Returns None outside the measured range so the caller falls back to the
+        per-operator composition path.
+        """
+        if batch_size < sizes[0] or batch_size > sizes[-1]:
+            return None
+        lo, hi = 0, len(sizes) - 1
+        if batch_size == sizes[hi]:
+            return walls_ms[hi]
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if sizes[mid] <= batch_size:
+                lo = mid
+            else:
+                hi = mid
+        b0, b1 = sizes[lo], sizes[hi]
+        w0, w1 = walls_ms[lo], walls_ms[hi]
+        if b1 == b0:
+            return w0
+        return w0 + (w1 - w0) * (batch_size - b0) / (b1 - b0)
+
+    def _maybe_decode_step_wall_execution_time(
+        self, batch: Batch, num_layers: int
+    ) -> Optional[ExecutionTime]:
+        """Time a graph-captured pure decode batch from measured step walls.
+
+        The measured engine_step wall already contains the GPU graph replay
+        (including in-graph TP collectives) and the serialized CPU control
+        plane, so the returned ExecutionTime zeroes the separate
+        communication/CPU components to avoid double counting.  The capture
+        ran at a short context (anchor_kv), so the attention decode term is
+        corrected with the kernel-only attention model:
+        total = wall(B) + attn(B, kv_now) - attn(B, anchor_kv).
+
+        Ledger attribution note: attention_decode carries the true
+        context-corrected whole-model attention time; the remaining
+        context-invariant part (linear + norm + comm + CPU) is carried by
+        mlp_layer_up_proj_execution_time as an aggregate residual.
+        """
+        table = self._get_decode_step_wall_table()
+        if table is None:
+            return None
+        if self._cluster_type not in (None, ClusterType.MONOLITHIC):
+            return None
+        if getattr(batch, "num_prefill_tokens", 0) > 0:
+            return None
+        if getattr(batch, "num_decode_tokens", 0) <= 0:
+            return None
+        if self._get_decode_cuda_graph_runtime_mode(batch) != "FULL":
+            return None
+
+        (
+            decode_batch_size,
+            decode_avg_kv_cache_size,
+        ) = self._get_batch_decode_attention_params(batch)
+        if decode_batch_size <= 0:
+            return None
+        wall_ms = self._interp_step_wall(
+            table["sizes"], table["walls_ms"], decode_batch_size
+        )
+        if wall_ms is None:
+            return None
+
+        decode_op_name = self._dense_attention_decode_op_name()
+        predictions = self._predictions.get(decode_op_name)
+        if not isinstance(predictions, dict) or not predictions:
+            return None
+        attn_now = predictions.get((decode_batch_size, decode_avg_kv_cache_size))
+        if attn_now is None:
+            # Same lookup the normal path would fail on; stay consistent.
+            raise ValueError(
+                f"attention decode prediction cache miss for "
+                f"(batch={decode_batch_size}, kv={decode_avg_kv_cache_size}) "
+                "in decode step-wall override"
+            )
+        anchor_map = getattr(self, "_decode_step_wall_anchor_map", None)
+        if anchor_map is None:
+            anchor_map = {}
+            self._decode_step_wall_anchor_map = anchor_map
+        if decode_batch_size not in anchor_map:
+            anchor_candidates = [
+                kv for (b, kv) in predictions.keys() if b == decode_batch_size
+            ]
+            anchor_map[decode_batch_size] = (
+                min(
+                    anchor_candidates,
+                    key=lambda kv: abs(kv - table["anchor_kv"]),
+                )
+                if anchor_candidates
+                else None
+            )
+        anchor_kv = anchor_map[decode_batch_size]
+        if anchor_kv is None:
+            return None
+        attn_anchor = predictions[(decode_batch_size, anchor_kv)]
+
+        attn_whole_ms = attn_now * num_layers
+        context_correction_ms = (attn_now - attn_anchor) * num_layers
+        total_ms = wall_ms + max(context_correction_ms, 0.0)
+        residual_ms = max(total_ms - attn_whole_ms, 0.0)
+
+        return ExecutionTime(
+            num_layers_per_pipeline_stage=1,  # whole-model values below
+            attention_rope_execution_time=0.0,
+            attention_kv_cache_save_execution_time=0.0,
+            attention_decode_execution_time=attn_whole_ms,
+            attention_prefill_execution_time=0.0,
+            attention_layer_pre_proj_execution_time=0.0,
+            attention_layer_post_proj_execution_time=0.0,
+            attn_norm_time=0.0,
+            mlp_norm_time=0.0,
+            add_time=0.0,
+            tensor_parallel_communication_time=0.0,
+            pipeline_parallel_communication_time=0.0,
+            expert_parallel_communication_time=0.0,
+            moe_gating_time=0.0,
+            moe_shuffling_time=0.0,
+            schedule_time=0.0,
+            sampler_e2e_time=0.0,
+            prepare_inputs_e2e_time=0.0,
+            process_model_outputs_time=0.0,
+            ray_comm_time=0.0,
+            is_moe=False,
+            mlp_layer_up_proj_execution_time=residual_ms,
+        )
+
 
     def _get_attention_decode_execution_time(self, batch: Batch) -> float:
         (
@@ -6004,6 +6464,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         return method_host_overhead_ms
 
     def _get_cpu_overhead_features(self, batch: Batch) -> Dict[str, int]:
+        # The five CPU-overhead metrics are predicted back-to-back for the
+        # same batch; memoize the feature dict for that burst.
+        memo = getattr(self, "_cpu_overhead_features_memo", None)
+        if memo is not None and memo[0] is batch:
+            return memo[1]
         batch_size = int(getattr(batch, "size", 0))
 
         num_prefill_tokens = int(
@@ -6019,11 +6484,13 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 batch_size * DEFAULT_NUM_DECODE_TOKENS_AMPLIFICATION_FACTOR
             )
 
-        return {
+        features = {
             "batch_size": batch_size,
             "num_prefill_tokens": num_prefill_tokens,
             "num_decode_tokens": num_decode_tokens,
         }
+        self._cpu_overhead_features_memo = (batch, features)
+        return features
 
     def _log_missing_cpu_overhead_prediction_once(self, metric_name: str) -> None:
         missing_cache = getattr(self, "_missing_cpu_overhead_metrics_logged", None)
@@ -6531,22 +6998,23 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         cluster_type: ClusterType,
     ) -> AttentionTime:
         operator_times = self._get_mla_attention_operator_times(batch)
-        cluster_name = cluster_type.name
-        batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"batch_input_lens={batch_input_lens}, model_type=mla"
-        )
-        for op_name, predicted_time_ms in operator_times.op_times.items():
+        if logger.isEnabledFor(logging.INFO):
+            cluster_name = cluster_type.name
+            batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
             logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={predicted_time_ms:.6f}"
+                f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"batch_input_lens={batch_input_lens}, model_type=mla"
             )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
-            f"total_attention_time_ms={operator_times.total_time():.6f}"
-        )
+            for op_name, predicted_time_ms in operator_times.op_times.items():
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={predicted_time_ms:.6f}"
+                )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
+                f"total_attention_time_ms={operator_times.total_time():.6f}"
+            )
         return AttentionTime(operator_times=operator_times)
 
     def predict_attention_layer_time(
@@ -6566,7 +7034,8 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # Check if this is an idle batch
         if batch.is_idle:
             logger.debug(
-                f"Idle batch detected (batch_id={batch.id}), skipping attention computation"
+                "Idle batch detected (batch_id=%s), skipping attention computation",
+                batch.id,
             )
             raise ValueError("Idle batch detected, skipping attention computation")
             # return AttentionTime(
@@ -6674,61 +7143,62 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # Operation-level tracing for attention operations
         # This enables comparison with real vLLM operation-level GPU execution traces
         # Refactored to use dynamic cluster_type.name instead of if/elif branching
-        cluster_name = cluster_type.name
-        batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
+        if logger.isEnabledFor(logging.INFO):
+            cluster_name = cluster_type.name
+            batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
 
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"batch_input_lens={batch_input_lens}, model_type=dense"
-        )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"batch_input_lens={batch_input_lens}, model_type=dense"
+            )
 
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"num_prefill_tokens={batch.num_prefill_tokens}, num_decode_tokens={batch.num_decode_tokens}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][input_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_norm_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_pre_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_pre_proj_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_rope] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_rope_time:.6f}"
-        )
-        if batch.num_prefill_tokens > 0:
             logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{prefill_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_prefill_time:.6f}"
+                f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"num_prefill_tokens={batch.num_prefill_tokens}, num_decode_tokens={batch.num_decode_tokens}"
             )
-        if batch.num_decode_tokens > 0:
             logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{decode_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_decode_time:.6f}"
+                f"[OP-TRACE][{cluster_name}][ATTENTION][input_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_norm_time:.6f}"
             )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][{cache_write_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_kv_cache_save_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_post_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_post_proj_time:.6f}"
-        )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_pre_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_pre_proj_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_rope] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_rope_time:.6f}"
+            )
+            if batch.num_prefill_tokens > 0:
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{prefill_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_prefill_time:.6f}"
+                )
+            if batch.num_decode_tokens > 0:
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{decode_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_decode_time:.6f}"
+                )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][{cache_write_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_kv_cache_save_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_post_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_post_proj_time:.6f}"
+            )
 
-        # Architecture-profile attention extra operation tracing.
-        if "attn_inter_norm" in self._get_predictor_attention_extra_ops():
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_inter_norm] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_inter_norm_time:.6f}"
-            )
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_wq_proj] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_wq_proj_time:.6f}"
-            )
+            # Architecture-profile attention extra operation tracing.
+            if "attn_inter_norm" in self._get_predictor_attention_extra_ops():
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][attn_inter_norm] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_inter_norm_time:.6f}"
+                )
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][attn_wq_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_wq_proj_time:.6f}"
+                )
 
         total_attention_time = (
             attn_norm_time
@@ -6742,10 +7212,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             + attn_inter_norm_time
             + attn_wq_proj_time
         )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
-            f"total_attention_time_ms={total_attention_time:.6f}"
-        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                f"[OP-TRACE][{cluster_type.name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
+                f"total_attention_time_ms={total_attention_time:.6f}"
+            )
 
         return AttentionTime(
             attention_prefill_execution_time=attn_prefill_time,
@@ -6784,14 +7255,13 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             )
 
         # Extract detailed batch information for logging
-        batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
-        batch_request_ids = [req.id for req in batch.requests]
-
-        logger.debug(
-            f"Predicting MLP layer time for layer_id={layer_id}, cluster_type={cluster_type.name}, "
-            f"batch_id={batch.id}, num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"batch_input_lens={batch_input_lens}, batch_request_ids={batch_request_ids}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Predicting MLP layer time for layer_id={layer_id}, cluster_type={cluster_type.name}, "
+                f"batch_id={batch.id}, num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"batch_input_lens={[req.num_prefill_tokens for req in batch.requests]}, "
+                f"batch_request_ids={[req.id for req in batch.requests]}"
+            )
 
         # Get individual MLP operation times for detailed tracing
         mlp_up_proj_time = self._get_mlp_layer_up_proj_execution_time(batch)
@@ -6802,41 +7272,43 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # Operation-level tracing for MLP (dense model FFN) operations
         # This enables comparison with real vLLM operation-level GPU execution traces
         # Refactored to use dynamic cluster_type.name instead of if/elif branching
-        cluster_name = cluster_type.name
+        if logger.isEnabledFor(logging.INFO):
+            cluster_name = cluster_type.name
 
-        # Header log with batch details
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"batch_input_lens={batch_input_lens}, model_type=dense"
-        )
+            # Header log with batch details
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][MLP] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"batch_input_lens={[req.num_prefill_tokens for req in batch.requests]}, model_type=dense"
+            )
 
-        # Individual operation logs
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP][post_attention_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={mlp_norm_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP][mlp_up_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={mlp_up_proj_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP][mlp_act] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={mlp_act_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP][mlp_down_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={mlp_down_proj_time:.6f}"
-        )
+            # Individual operation logs
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][MLP][post_attention_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={mlp_norm_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][MLP][mlp_up_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={mlp_up_proj_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][MLP][mlp_act] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={mlp_act_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][MLP][mlp_down_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={mlp_down_proj_time:.6f}"
+            )
 
         # Total time log
         total_mlp_time = (
             mlp_norm_time + mlp_up_proj_time + mlp_act_time + mlp_down_proj_time
         )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][MLP][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
-            f"total_mlp_time_ms={total_mlp_time:.6f}"
-        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                f"[OP-TRACE][{cluster_type.name}][MLP][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
+                f"total_mlp_time_ms={total_mlp_time:.6f}"
+            )
 
         return MLPTime(
             mlp_layer_up_proj_execution_time=mlp_up_proj_time,
@@ -7111,9 +7583,16 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             return self._get_dummy_execution_time(batch, stage_id)
 
         logger.debug(
-            f"[EXEC_TIME_PREDICT] Predicting stage execution time: stage_id={stage_id}, "
-            f"cluster_type={cluster_type}, num_layers={num_layers}, layer_id={layer_id}, batch_id={batch.id}, "
-            f"batch_size={batch.size}, num_tokens={batch.num_tokens}"
+            "[EXEC_TIME_PREDICT] Predicting stage execution time: stage_id=%s, "
+            "cluster_type=%s, num_layers=%s, layer_id=%s, batch_id=%s, "
+            "batch_size=%s, num_tokens=%s",
+            stage_id,
+            cluster_type,
+            num_layers,
+            layer_id,
+            batch.id,
+            batch.size,
+            batch.num_tokens,
         )
 
         assert num_layers >= 1, f"num_layers must be >= 1, got {num_layers}"
@@ -7121,6 +7600,16 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         measurement_type = self._select_measurement_type_for_batch(batch)
         self._require_predictions_for_measurement_type(measurement_type, batch)
         self._activate_measurement_type(measurement_type)
+
+        # SwiftMind decode step-wall override: when a measured full-step table
+        # is configured, graph-captured pure decode batches bypass the
+        # per-operator composition below and return the measured whole-step
+        # wall (context-corrected) instead.
+        step_wall_override = self._maybe_decode_step_wall_execution_time(
+            batch, num_layers
+        )
+        if step_wall_override is not None:
+            return step_wall_override
 
         # Calculate first-class communication operators for the dense live path.
         communication_operator_times: dict[str, float] = {}
@@ -7355,10 +7844,15 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         pp_comm_time = pipeline_parallel_communication_time
 
         logger.debug(
-            f"[EXEC_TIME_SUMMARY] batch_id={batch.id}, stage={stage_id}: "
-            f"attn_total={(attn_rope_time + attn_kv_save_time + attn_decode_time + attn_prefill_time + attn_pre_proj_time + attn_post_proj_time):.6f}ms, "
-            f"mlp_total={(mlp_up_proj_time + mlp_down_proj_time + mlp_act_time):.6f}ms, "
-            f"comm_total={(tp_comm_time + pp_comm_time):.6f}ms"
+            "[EXEC_TIME_SUMMARY] batch_id=%s, stage=%s: "
+            "attn_total=%.6fms, "
+            "mlp_total=%.6fms, "
+            "comm_total=%.6fms",
+            batch.id,
+            stage_id,
+            attn_rope_time + attn_kv_save_time + attn_decode_time + attn_prefill_time + attn_pre_proj_time + attn_post_proj_time,
+            mlp_up_proj_time + mlp_down_proj_time + mlp_act_time,
+            tp_comm_time + pp_comm_time,
         )
 
         base_execution_time = ExecutionTime(

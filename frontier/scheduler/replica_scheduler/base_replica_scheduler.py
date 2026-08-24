@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import os
 from typing import Any, Dict, List, Sequence
 
 from frontier.config import (
@@ -106,9 +107,6 @@ class BaseReplicaScheduler(ABC):
                     f"got={num_blocks_mode!r}"
                 )
 
-            from frontier.profiling.non_kv_cache_overhead.runtime_estimator import (
-                estimate_non_kv_cache_profile,
-            )
             from frontier.profiling.non_kv_cache_overhead.nccl_buffer_estimator import (
                 NCCLBufferEstimationConfig,
             )
@@ -177,22 +175,91 @@ class BaseReplicaScheduler(ABC):
                 ),
             )
 
-            profile_result = estimate_non_kv_cache_profile(
-                replica_config=self._replica_config,
-                cluster_type=cluster_type_for_profile,
-                max_num_batched_tokens=profile_max_num_batched_tokens,
-                weights_memory_bytes=input_weights_memory_bytes,
-                weights_memory_source=runtime_weights_memory_source,
-                nccl_buffer_config=nccl_buffer_config,
-            )
+            # Cross-run disk cache: the profile result is a pure function of
+            # the static inputs above, and producing it requires importing the
+            # vLLM-backed profiling stack (~seconds) plus a GPU measurement.
+            # Resolve from a small JSON store first; only fall back to the
+            # real estimator (and its heavy imports) on a cache miss.
+            disk_cache_dir = os.environ.get(
+                "FRONTIER_SIM_RUNTIME_PROFILE_CACHE_DIR", ""
+            ).strip()
+            disk_cache_enabled = bool(disk_cache_dir) and os.environ.get(
+                "FRONTIER_SIM_RUNTIME_PROFILE_NO_CACHE", ""
+            ) != "1"
+            profile_result = None
+            disk_cache_key = None
+            if disk_cache_enabled:
+                from frontier.profiling.non_kv_cache_overhead.runtime_profile_disk_cache import (
+                    build_runtime_profile_disk_cache_key,
+                    load_runtime_profile_cache,
+                )
 
-            planner_overhead_bytes = int(profile_result.overhead_bytes)
-            measured_weights_memory_bytes = int(profile_result.measured_weights_memory_bytes)
+                disk_cache_key = build_runtime_profile_disk_cache_key(
+                    replica_config=self._replica_config,
+                    cluster_type=cluster_type_for_profile,
+                    max_num_batched_tokens=profile_max_num_batched_tokens,
+                    weights_memory_bytes=input_weights_memory_bytes,
+                    weights_memory_source=runtime_weights_memory_source,
+                    nccl_buffer_config=nccl_buffer_config,
+                )
+                profile_result = load_runtime_profile_cache(
+                    disk_cache_dir, disk_cache_key
+                )
+
+            if profile_result is None:
+                from frontier.profiling.non_kv_cache_overhead.runtime_estimator import (
+                    estimate_non_kv_cache_profile,
+                )
+
+                est_result = estimate_non_kv_cache_profile(
+                    replica_config=self._replica_config,
+                    cluster_type=cluster_type_for_profile,
+                    max_num_batched_tokens=profile_max_num_batched_tokens,
+                    weights_memory_bytes=input_weights_memory_bytes,
+                    weights_memory_source=runtime_weights_memory_source,
+                    nccl_buffer_config=nccl_buffer_config,
+                )
+                profile_result = {
+                    "input_weights_memory_bytes": int(
+                        est_result.input_weights_memory_bytes
+                    ),
+                    "measured_weights_memory_bytes": int(
+                        est_result.measured_weights_memory_bytes
+                    ),
+                    "overhead_bytes": int(est_result.overhead_bytes),
+                    "non_kv_cache_memory_bytes": int(
+                        est_result.non_kv_cache_memory_bytes
+                    ),
+                    "torch_peak_increase_bytes": int(
+                        est_result.torch_peak_increase_bytes
+                    ),
+                    "non_torch_increase_bytes": int(
+                        est_result.non_torch_increase_bytes
+                    ),
+                    "total_memory_bytes": (
+                        None
+                        if est_result.total_memory_bytes is None
+                        else int(est_result.total_memory_bytes)
+                    ),
+                }
+                if disk_cache_enabled:
+                    from frontier.profiling.non_kv_cache_overhead.runtime_profile_disk_cache import (
+                        store_runtime_profile_cache,
+                    )
+
+                    store_runtime_profile_cache(
+                        disk_cache_dir, disk_cache_key, profile_result
+                    )
+
+            planner_overhead_bytes = int(profile_result["overhead_bytes"])
+            measured_weights_memory_bytes = int(
+                profile_result["measured_weights_memory_bytes"]
+            )
             if not use_analytical_param_memory:
                 adjusted_overhead = (
-                    int(profile_result.overhead_bytes)
+                    int(profile_result["overhead_bytes"])
                     + measured_weights_memory_bytes
-                    - int(profile_result.input_weights_memory_bytes)
+                    - int(profile_result["input_weights_memory_bytes"])
                 )
                 if adjusted_overhead < 0:
                     raise RuntimeError(
@@ -629,9 +696,16 @@ class BaseReplicaScheduler(ABC):
         )
         af_len = len(self._af_immediate_batch_queue) if hasattr(self, '_af_immediate_batch_queue') else 0
         logger.info(
-            f"[RS-IDLE-CHECK][replica={self._replica_id}][dp={self._dp_id}] "
-            f"num_pending_requests={self.num_pending_requests}, allocated_blocks={len(self._allocation_map)}, "
-            f"num_running_batches={self._num_running_batches}, stages_empty={stages_empty}, af_immediate_len={af_len}"
+            "[RS-IDLE-CHECK][replica=%s][dp=%s] "
+            "num_pending_requests=%s, allocated_blocks=%s, "
+            "num_running_batches=%s, stages_empty=%s, af_immediate_len=%s",
+            self._replica_id,
+            self._dp_id,
+            self.num_pending_requests,
+            len(self._allocation_map),
+            self._num_running_batches,
+            stages_empty,
+            af_len,
         )
         # If AF immediate queue has pending batches, the replica is not idle
         if af_len > 0:
