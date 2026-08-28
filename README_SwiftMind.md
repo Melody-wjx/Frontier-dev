@@ -61,21 +61,88 @@ sklearn RandomForest 预测是绝对热点（单次 predict 的 pandas/joblib �
 - **mixed step-wall 开关**：曾对称实现，验证发现高并发 agentic 场景严重过冲
   （kv 外推过度 + 反馈链放大），已按用户决策完整回退，本分支无残留。
 
-## 加速效果汇总
+## 实验设置：workload 说明
 
-agentic500 主线（同一 workload、热 cache 口径）：
+所有加速实验在以下 workload 上进行（均为 thinking 模式、TP=2、BF16、
+full_decode_only CUDA Graph、chunked prefill，sim 与 GT 配置严格对齐）：
 
-```
-E0 基线 157 s → E1 日志守卫 107.7 s → E6 RF 快速路径+on-demand cache 27 s 热
-→ E9 sklearn 懒加载 24.5 s → E12b 23.3 s → E13b npz 18.0 s
-→ E14 关诊断 16.0 s → E19 +Track S ~15 s
-```
+| Workload | 内容 | vLLM GT 墙钟（含启动） |
+|---|---|---:|
+| `agentic500` | ShareGPT agentic，90 sessions / 500 子请求，多轮 | 101.7 s |
+| `agentic1000` | ShareGPT agentic，224 sessions / 1000 子请求，多轮 | 160.7 s |
+| `long60` | ShareGPT 长输出，60 sessions / 60 子请求，单轮 | 53.0 s |
+| `swg105` | SWG stage4，4 sessions / 105 子请求（batch cap ≤4） | 375.9 s（makespan 343.9 s） |
+| `swg_a8/a16/b2/b3` | SWG scaling 变体（a=session 数扩展，b=每 session 轮数扩展） | 见主项目 doc |
 
-- ShareGPT 三家对 08-19 基线 request_metrics 全数值列最大偏差 ≤ 4e-11；
-  SWG 全量优化后与基线逐比特一致（0.0）。
-- 对 ground truth 的精度不变（误差指标逐位相同，见 retained_results 各表）。
-- SWG workload：基线 225 s（含 inline 训练）→ 27.8 s，对 vLLM GT 墙钟
-  加速比 ~7–13×（视口径）。
+## E 编号实验对照（全部为 agentic500，除注明外）
+
+计时为 sim 端到端墙钟（含 ~14–15 s 启动固定成本），"热"= on-demand 持久化
+cache 已有命中。"对基线 max_abs_diff"指 request_metrics 全数值列对 08-19 基线
+（原始 Frontier）的最大绝对偏差。
+
+| 运行 | Workload | 新增优化 | 墙钟 | 数值等价性 |
+|---|---|---|---:|---|
+| E0 | agentic500 | 基线（原始 Frontier） | 157 s | 0（定义） |
+| E1 | agentic500 | 日志级别守卫 + Vidur cc cache | 107.7 s | — |
+| E6 | agentic500 | +RF 快速路径 + on-demand cache | 80 s 冷 / 27 s 热 | ≤4e-11 |
+| E6 | agentic1000 / long60 | 同上 | 78 s / 25 s | ≤4e-11 |
+| E7/E7b | swg105 | 同上（先建 predictor cache） | 51.9 s 冷 / 51.1 s 热 | E7b vs E7 逐比特（0.0） |
+| E9 | agentic500 / swg105 | +sklearn 模型懒加载 | 32.7 s 冷 / 24.5 s 热；swg 46.5 s | 3.6e-11；swg 对 E7b 逐比特 |
+| E12b | agentic500 | +runtime 内存测量缓存 + vllm 懒导入 | 23.3 s 热 | 3.6e-11 |
+| E13b | agentic500 | +npz 网格预测 cache | 18.0 s 热 | 3.3e-10（npz ulp 噪声，已接受） |
+| E14 | agentic500 | +关 batch 诊断输出 | 16.0 s 热 | 3.3e-10 |
+| E16–E19 | agentic500 | +Track S 逐项（S1–S5） | **15.2 s** 热 | 对 E14 **逐比特相等（0.0）** |
+| E15/E20 | swg105 | SWG 全量优化 / +Track S | 37.2 s / **27.8 s** | 0.0 / 2.2e-08（对 E7b） |
+
+（E2–E5 为消融对照、E8/E10/E18 为 cProfile 画像运行，非独立优化点；消融细节见
+主项目 `doc/retained_results_20260820.md` 与
+`outputs/result/Frontier_dev_speedup/ablation/summary.txt`。）
+
+## 加速比（sim 墙钟 vs vLLM GT 墙钟）
+
+| Workload | 基线 sim（E0 口径） | 最终 sim（热） | GT 墙钟 | 加速比 |
+|---|---:|---:|---:|---:|
+| agentic500 | 157 s | ~15.2–16.0 s | 101.7 s | **≈6.5×** |
+| agentic1000 | — | 78 s | 160.7 s | ≈2.1× |
+| long60 | 37 s | 25 s | 53.0 s | ≈2.1× |
+| swg105 | 225 s（含 inline 训练） | 27.8 s | 375.9 s | **≈13.5×** |
+
+说明：agentic1000/long60 的 2.1× 取自 E6 时点的部分优化状态，未在最终优化
+完整栈上重测；SWG 规模小、墙钟由固定启动开销主导，热/冷差异不大。宿主机
+计时噪声可达 ±30%（共享集群），上表为干净时段样本。
+
+## 误差分析
+
+**加速优化本身不引入误差。** 判据分两级：Track S 各项对优化前输出**逐比特
+相等**（0.0）；含 npz 迁移的完整栈对 08-19 基线的 request_metrics 最大绝对
+偏差 3.3e-10（npz 重建 dict 的浮点末位 ulp 噪声，对 MAPE 影响 < 1e-12 个
+百分点）。对 GT 的误差指标与基线逐位相同（如 swg105：E2E MAPE 7.8863% vs
+基线 7.8860%，差来自 predictor 在 sklearn 1.9.0 重训而非本分支代码）。
+
+**当前精度水平**（D2c canonical 配置 + 本分支全部加速优化，makespan 为全局
+span 口径；E2E/TTFT/TPOT 为 MAPE%）：
+
+| Workload | makespan 偏差 | E2E | TTFT | TPOT |
+|---|---:|---:|---:|---:|
+| agentic500 | −0.0% | 2.26 | 3.27 | 3.55 |
+| agentic1000 | −6.2% | 10.34 | 11.32 | 9.03 |
+| long60 | +8.0% | 15.50 | 7.45 | 15.73 |
+| swg_a8 | −8.5% | 4.80 | 4.82 | 13.24 |
+| swg_a16 | +1.0% | 4.26 | 4.25 | 10.16 |
+| swg_b2 | +0.3% | 1.03 | 0.90 | 19.51 |
+| swg_b3 | +2.5% | 3.92 | 3.72 | 28.74 |
+| swg105 | +6.2% | 6.50 | 6.37 | 22.79 |
+
+误差结构（详见主项目 `doc/retained_results_20260820/21.md`）：
+
+- E2E/makespan 误差主要来自精度侧修复（D1 Vidur 出界、D2c CPU-overhead
+  CUDA Graph 标定），与本分支的加速修改无关；
+- 多轮 agentic workload 的残差误差由"每轮完成后重新排队"的反馈链放大，
+  轮数越多/并发越高误差越大（agentic1000 > agentic500 > 单轮 long60 的
+  E2E 反而更差是 long60 的 decode 高估无反向抵消所致）；
+- TPOT 残差（9–29%）源于 eager 算子 profile 与 CUDA Graph GT 的结构性差异；
+  decode step-wall 开关（本分支保留、默认关）是该方向的候选修正，验证显示
+  仅在 agentic1000 上有全面收益。
 
 ## 文件清单
 
