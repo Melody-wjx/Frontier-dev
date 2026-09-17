@@ -191,7 +191,7 @@ cache_random_forrest
 cache_linear_regression
 cache*
 simulator_output
-# outputs/
+outputs/
 wandb
 train.zip
 profiling_outputs
