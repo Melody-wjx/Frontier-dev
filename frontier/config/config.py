@@ -5747,17 +5747,6 @@ class SimulationConfig(ABC):
             "choices": ["none", "full_decode_only", "piecewise"],
         },
     )
-    decode_step_wall_table_file: str = field(
-        default="",
-        metadata={
-            "help": "Optional path to a decode step-wall table JSON "
-            "(swiftmind.frontier.decode_step_wall_table.v1, built from vLLM "
-            "grid-capture engine_step events). When set, pure decode batches "
-            "that hit the CUDA Graph capture ladder are timed from measured "
-            "engine-step wall times plus a context correction instead of the "
-            "per-operator composition.",
-        },
-    )
     allow_spec_decode_cuda_graph_diagnostic: bool = field(
         default=False,
         metadata={
@@ -5993,7 +5982,6 @@ class SimulationConfig(ABC):
             self.decode_cuda_graph_mode,
             self.allow_spec_decode_cuda_graph_diagnostic,
         )
-        global_vars.set_decode_step_wall_table_file(self.decode_step_wall_table_file)
 
         # Initialize global IS_MOE flag from model configuration
         # This must be done early, before any code checks is_moe

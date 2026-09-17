@@ -1244,6 +1244,27 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"\nAll-NaN columns: {all_nan_columns}"
             )
 
+    def _uses_unified_attention_profile(self) -> bool:
+        """FLASH_ATTN true-mixed rows record one physical call in attn_decode.
+
+        Read the profile even when trained models are loaded from cache. Legacy
+        FlashInfer files and callers without a profile retain their old path.
+        """
+        path = getattr(self, "_attention_input_file", None)
+        if not path:
+            return False
+        cache = getattr(self, "_unified_attention_profile_cache", {})
+        if path not in cache:
+            if not os.path.isfile(path):
+                # Mocked training/dataframe-only callers have no physical
+                # profile. Normal predictor initialization validates inputs.
+                return False
+            header = pd.read_csv(path, nrows=1)
+            backend = str(header.iloc[0].get("attention_backend", ""))
+            cache[path] = backend.split(".")[-1] == "FLASH_ATTN"
+            self._unified_attention_profile_cache = cache
+        return cache[path]
+
     def _load_attention_df(self, file_path: str) -> pd.DataFrame:
         df = pd.read_csv(file_path)
         df = df.drop_duplicates()
@@ -3429,7 +3450,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                     *true_mixed_prefill_feature_map.values(),
                     "time_stats.attn_prefill.median",
                 ]
-                if len(true_mixed_df) > 0 and all(
+                if not self._uses_unified_attention_profile() and len(true_mixed_df) > 0 and all(
                     col in true_mixed_df.columns for col in true_mixed_required_cols
                 ):
                     true_mixed_prefill_df = true_mixed_df[
@@ -3465,7 +3486,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                                 "prefill-side mixed features for attn_prefill_mixed."
                             )
                         mixed_prefill_sources.append(true_mixed_prefill_df)
-                elif len(true_mixed_df) > 0 and all(
+                elif not self._uses_unified_attention_profile() and len(true_mixed_df) > 0 and all(
                     col in true_mixed_df.columns
                     for col in [*mixed_feature_cols, "time_stats.attn_prefill.median"]
                 ):
@@ -3515,6 +3536,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 "batch_composition_ratio",
                 "total_tokens",
             ]
+            if self._uses_unified_attention_profile():
+                decode_in_mixed_feature_cols += ["prefill_mixed_kv_cache_size",
+                                                "prefill_mixed_max_seq_len"]
             if all(col in true_mixed_df.columns for col in decode_in_mixed_feature_cols):
                 if len(true_mixed_df) > 0:
                     models["attn_decode_in_mixed"] = self._train_model(
@@ -3566,6 +3590,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "batch_composition_ratio",
             "total_tokens",
         ]
+        if self._uses_unified_attention_profile():
+            decode_in_mixed_feature_cols += ["prefill_mixed_kv_cache_size",
+                                            "prefill_mixed_max_seq_len"]
         if all(col in true_mixed_df.columns for col in decode_in_mixed_feature_cols):
             if len(true_mixed_df) > 0:
                 models["attn_decode_in_mixed"] = self._train_model(
@@ -4257,6 +4284,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "batch_composition_ratio": batch_composition_ratio,
             "total_tokens": total_tokens,
         }
+        if self._uses_unified_attention_profile():
+            prefill_features = self._get_batch_prefill_mixed_features(batch)
+            features["prefill_mixed_kv_cache_size"] = prefill_features["kv_cache_size"]
+            features["prefill_mixed_max_seq_len"] = prefill_features["max_seq_len"]
         batch._decode_mixed_features = features
         return features
 
@@ -5609,11 +5640,18 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             )
             num_devices = tp_size
 
-            result = self._cc_backend.predict_allreduce(
+            predict_allreduce = self._cc_backend.predict_allreduce
+            mode_kwargs = {}
+            if hasattr(self._cc_backend, "predict_allreduce_for_execution_mode"):
+                predict_allreduce = self._cc_backend.predict_allreduce_for_execution_mode
+                mode_kwargs["execution_mode"] = (
+                    "graph" if self._get_decode_cuda_graph_runtime_mode(batch) == "FULL" else "eager")
+            result = predict_allreduce(
                 data_size_bytes=data_size_bytes,
                 num_devices=num_devices,
                 cluster_type=self._cluster_type,
                 comm_domain="ATTN_TP",
+                **mode_kwargs,
             )
             result = self._strip_collective_sim_allreduce_launch_overhead_if_needed(
                 batch=batch,
@@ -5712,12 +5750,31 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 raise ValueError(
                     f"CommOperator {operator.name} requires num_devices for allreduce"
                 )
-            predicted_ms = self.predict_allreduce_time(
-                data_size_bytes=data_size_bytes,
-                num_devices=num_devices,
-                cluster_type=self._cluster_type,
-                comm_domain=operator.comm_domain,
+            mode_predictor = getattr(
+                self._cc_backend, "predict_allreduce_for_execution_mode", None
             )
+            if callable(mode_predictor):
+                # This is the live dense-model operator path. The legacy
+                # _get_tensor_parallel_communication_time wrapper alone does
+                # not route graph measurements into get_execution_time().
+                predicted_ms = mode_predictor(
+                    execution_mode=(
+                        "graph"
+                        if self._get_decode_cuda_graph_runtime_mode(batch) == "FULL"
+                        else "eager"
+                    ),
+                    data_size_bytes=data_size_bytes,
+                    num_devices=num_devices,
+                    cluster_type=self._cluster_type,
+                    comm_domain=operator.comm_domain,
+                )
+            else:
+                predicted_ms = self.predict_allreduce_time(
+                    data_size_bytes=data_size_bytes,
+                    num_devices=num_devices,
+                    cluster_type=self._cluster_type,
+                    comm_domain=operator.comm_domain,
+                )
             if operator.apply_allreduce_launch_overhead_strip:
                 if operator.comm_domain is None:
                     raise ValueError(
@@ -5837,178 +5894,6 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "attn_kv_cache_save_calibration_scale",
         )
 
-    # ------------------------------------------------------------------
-    # SwiftMind decode step-wall table override (measured full-step timing)
-    # ------------------------------------------------------------------
-
-    def _get_decode_step_wall_table(self) -> Optional[dict]:
-        """Lazily load the decode step-wall table built from vLLM grid capture.
-
-        Returns {"sizes": [int...], "walls_ms": [float...], "anchor_kv": int}
-        or None when the feature is disabled / the artifact is missing.
-        """
-        if getattr(self, "_decode_step_wall_table_loaded", False):
-            return self._decode_step_wall_table
-        self._decode_step_wall_table_loaded = True
-        self._decode_step_wall_table = None
-
-        path = global_vars.get_decode_step_wall_table_file()
-        if not path:
-            return None
-        if not os.path.isfile(path):
-            raise ValueError(
-                f"decode_step_wall_table_file not found: {path}"
-            )
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if payload.get("schema") != "swiftmind.frontier.decode_step_wall_table.v1":
-            raise ValueError(
-                f"unsupported decode step-wall table schema in {path}: "
-                f"{payload.get('schema')!r}"
-            )
-        entries = payload["entries"]
-        self._decode_step_wall_table = {
-            "sizes": [int(e["batch_size"]) for e in entries],
-            "walls_ms": [float(e["wall_ms"]) for e in entries],
-            "anchor_kv": int(payload["anchor_kv_cache_size"]),
-        }
-        logger.info(
-            "[DECODE_STEP_WALL] loaded %d batch-size entries from %s",
-            len(entries),
-            path,
-        )
-        return self._decode_step_wall_table
-
-    @staticmethod
-    def _interp_step_wall(sizes: List[int], walls_ms: List[float], batch_size: int):
-        """Linear interpolation over measured (batch_size -> wall_ms) points.
-
-        Returns None outside the measured range so the caller falls back to the
-        per-operator composition path.
-        """
-        if batch_size < sizes[0] or batch_size > sizes[-1]:
-            return None
-        lo, hi = 0, len(sizes) - 1
-        if batch_size == sizes[hi]:
-            return walls_ms[hi]
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            if sizes[mid] <= batch_size:
-                lo = mid
-            else:
-                hi = mid
-        b0, b1 = sizes[lo], sizes[hi]
-        w0, w1 = walls_ms[lo], walls_ms[hi]
-        if b1 == b0:
-            return w0
-        return w0 + (w1 - w0) * (batch_size - b0) / (b1 - b0)
-
-    def _maybe_decode_step_wall_execution_time(
-        self, batch: Batch, num_layers: int
-    ) -> Optional[ExecutionTime]:
-        """Time a graph-captured pure decode batch from measured step walls.
-
-        The measured engine_step wall already contains the GPU graph replay
-        (including in-graph TP collectives) and the serialized CPU control
-        plane, so the returned ExecutionTime zeroes the separate
-        communication/CPU components to avoid double counting.  The capture
-        ran at a short context (anchor_kv), so the attention decode term is
-        corrected with the kernel-only attention model:
-        total = wall(B) + attn(B, kv_now) - attn(B, anchor_kv).
-
-        Ledger attribution note: attention_decode carries the true
-        context-corrected whole-model attention time; the remaining
-        context-invariant part (linear + norm + comm + CPU) is carried by
-        mlp_layer_up_proj_execution_time as an aggregate residual.
-        """
-        table = self._get_decode_step_wall_table()
-        if table is None:
-            return None
-        if self._cluster_type not in (None, ClusterType.MONOLITHIC):
-            return None
-        if getattr(batch, "num_prefill_tokens", 0) > 0:
-            return None
-        if getattr(batch, "num_decode_tokens", 0) <= 0:
-            return None
-        if self._get_decode_cuda_graph_runtime_mode(batch) != "FULL":
-            return None
-
-        (
-            decode_batch_size,
-            decode_avg_kv_cache_size,
-        ) = self._get_batch_decode_attention_params(batch)
-        if decode_batch_size <= 0:
-            return None
-        wall_ms = self._interp_step_wall(
-            table["sizes"], table["walls_ms"], decode_batch_size
-        )
-        if wall_ms is None:
-            return None
-
-        decode_op_name = self._dense_attention_decode_op_name()
-        predictions = self._predictions.get(decode_op_name)
-        if not isinstance(predictions, dict) or not predictions:
-            return None
-        attn_now = predictions.get((decode_batch_size, decode_avg_kv_cache_size))
-        if attn_now is None:
-            # Same lookup the normal path would fail on; stay consistent.
-            raise ValueError(
-                f"attention decode prediction cache miss for "
-                f"(batch={decode_batch_size}, kv={decode_avg_kv_cache_size}) "
-                "in decode step-wall override"
-            )
-        anchor_map = getattr(self, "_decode_step_wall_anchor_map", None)
-        if anchor_map is None:
-            anchor_map = {}
-            self._decode_step_wall_anchor_map = anchor_map
-        if decode_batch_size not in anchor_map:
-            anchor_candidates = [
-                kv for (b, kv) in predictions.keys() if b == decode_batch_size
-            ]
-            anchor_map[decode_batch_size] = (
-                min(
-                    anchor_candidates,
-                    key=lambda kv: abs(kv - table["anchor_kv"]),
-                )
-                if anchor_candidates
-                else None
-            )
-        anchor_kv = anchor_map[decode_batch_size]
-        if anchor_kv is None:
-            return None
-        attn_anchor = predictions[(decode_batch_size, anchor_kv)]
-
-        attn_whole_ms = attn_now * num_layers
-        context_correction_ms = (attn_now - attn_anchor) * num_layers
-        total_ms = wall_ms + max(context_correction_ms, 0.0)
-        residual_ms = max(total_ms - attn_whole_ms, 0.0)
-
-        return ExecutionTime(
-            num_layers_per_pipeline_stage=1,  # whole-model values below
-            attention_rope_execution_time=0.0,
-            attention_kv_cache_save_execution_time=0.0,
-            attention_decode_execution_time=attn_whole_ms,
-            attention_prefill_execution_time=0.0,
-            attention_layer_pre_proj_execution_time=0.0,
-            attention_layer_post_proj_execution_time=0.0,
-            attn_norm_time=0.0,
-            mlp_norm_time=0.0,
-            add_time=0.0,
-            tensor_parallel_communication_time=0.0,
-            pipeline_parallel_communication_time=0.0,
-            expert_parallel_communication_time=0.0,
-            moe_gating_time=0.0,
-            moe_shuffling_time=0.0,
-            schedule_time=0.0,
-            sampler_e2e_time=0.0,
-            prepare_inputs_e2e_time=0.0,
-            process_model_outputs_time=0.0,
-            ray_comm_time=0.0,
-            is_moe=False,
-            mlp_layer_up_proj_execution_time=residual_ms,
-        )
-
-
     def _get_attention_decode_execution_time(self, batch: Batch) -> float:
         (
             decode_batch_size,
@@ -6069,6 +5954,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         )
 
     def _get_attention_prefill_execution_time(self, batch: Batch) -> float:
+        if (batch.num_prefill_tokens > 0 and batch.num_decode_tokens > 0
+                and self._uses_unified_attention_profile()):
+            # Unified varlen prefill+decode is consumed once via the mixed
+            # model in _get_attention_decode_execution_time.
+            return 0.0
         prefill_params = self._get_batch_prefill_attention_params(batch)
 
         if len(prefill_params) == 0:
@@ -7600,16 +7490,6 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         measurement_type = self._select_measurement_type_for_batch(batch)
         self._require_predictions_for_measurement_type(measurement_type, batch)
         self._activate_measurement_type(measurement_type)
-
-        # SwiftMind decode step-wall override: when a measured full-step table
-        # is configured, graph-captured pure decode batches bypass the
-        # per-operator composition below and return the measured whole-step
-        # wall (context-corrected) instead.
-        step_wall_override = self._maybe_decode_step_wall_execution_time(
-            batch, num_layers
-        )
-        if step_wall_override is not None:
-            return step_wall_override
 
         # Calculate first-class communication operators for the dense live path.
         communication_operator_times: dict[str, float] = {}

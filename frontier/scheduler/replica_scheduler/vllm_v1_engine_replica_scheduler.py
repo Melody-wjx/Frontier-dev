@@ -2858,7 +2858,24 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
         # Rewinding `_num_processed_tokens` there would contradict
         # `is_prefill_complete` and discard the handoff-emitted output token.
         victim._preempted = True
-        if self._cluster_type != ClusterType.DECODE_ATTN:
+        if self._cluster_type == ClusterType.MONOLITHIC and victim.is_prefill_complete:
+            # vLLM v1 recompute replay for requests preempted after prefill
+            # completed, mirroring `Request.restart()` as used by
+            # vllm_replica_scheduler: the computed prefix (prompt + already
+            # decoded tokens) is folded into a fresh prefill that replays on
+            # resumption, and the prefill lifecycle reopens. Without this the
+            # scheduler-visible frontier collapses to 0 while
+            # `is_prefill_complete` stays True, so the request can never be
+            # re-admitted. Thinking Mode keeps the active round index; only
+            # the active round's runtime token split is rewritten.
+            total_tokens = victim.total_tokens
+            victim._num_prefill_tokens = int(victim.num_processed_tokens)
+            victim._num_decode_tokens = total_tokens - victim._num_prefill_tokens
+            victim._num_processed_tokens = 0  # Reset computed tokens as in vLLM v1
+            victim._is_prefill_complete = False
+            victim._num_prefill_tokens_cached = 0
+            victim._scheduled = False
+        elif self._cluster_type != ClusterType.DECODE_ATTN:
             victim._num_processed_tokens = 0  # Reset computed tokens as in vLLM v1
         self._scheduled_num_computed_tokens_by_request.pop(victim.id, None)
 
@@ -3429,6 +3446,35 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
 
             if num_new_tokens <= 0:
                 waiting_queue.popleft()
+                if max_allowed <= 0:
+                    # Legitimate max_model_len backstop: the computed frontier
+                    # has reached the model context limit, so the request can
+                    # never make progress again (mirrors the DECODE-cluster
+                    # branch in _schedule_decode_only).
+                    logger.debug(
+                        "[VLLMv1Engine] Phase 2: dropping req=%s at "
+                        "max_model_len backstop (scheduler_computed_tokens=%s, "
+                        "max_model_len=%s)",
+                        request.id,
+                        self._get_scheduler_num_computed_tokens(request),
+                        self._max_model_len,
+                    )
+                    continue
+                # Any other non-positive num_new_tokens is an accounting
+                # anomaly; keep the request queued for a later iteration
+                # instead of silently dropping it.
+                skipped_waiting_requests.append(request)
+                logger.warning(
+                    "[VLLMv1Engine] Phase 2: req=%s has num_new_tokens=%s "
+                    "before reaching max_model_len (is_prefill_complete=%s, "
+                    "scheduler_computed_tokens=%s, max_model_len=%s); "
+                    "requeueing instead of dropping",
+                    request.id,
+                    num_new_tokens,
+                    getattr(request, "is_prefill_complete", None),
+                    self._get_scheduler_num_computed_tokens(request),
+                    self._max_model_len,
+                )
                 continue
 
             # Try to allocate (no preemption for waiting requests in Phase 2)

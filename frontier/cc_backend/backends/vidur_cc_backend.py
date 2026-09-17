@@ -99,6 +99,15 @@ class VidurCCBackend(BaseCCBackend):
 
         # Initialize models
         self._initialize_models()
+        # Only new, explicitly mode-tagged vLLM profiles have a second table.
+        graph_df = getattr(self, "_all_reduce_graph_df", None)
+        if graph_df is not None and not graph_df.empty:
+            graph_df = self._get_all_reduce_df_with_derived_features(graph_df)
+            graph_model = self._train_model("all_reduce_graph", graph_df,
+                                            ["num_tokens"], "time_stats.all_reduce.median")
+            self._models["all_reduce_graph"] = graph_model
+            self._predictions["all_reduce_graph"] = self._generate_predictions(
+                "all_reduce_graph", graph_model)
 
         logger.info(
             f"VidurCCBackend initialized with {len(self._models)} models, "
@@ -264,6 +273,12 @@ class VidurCCBackend(BaseCCBackend):
             & (df["devices_per_node"] == self._num_devices)
             & (df["collective"] == "all_reduce")
         ]
+        if "execution_mode" in filtered_df.columns:
+            modes = set(filtered_df["execution_mode"].dropna())
+            if modes != {"eager", "graph"}:
+                raise ValueError(f"Expected paired eager/graph collective data, got {modes}")
+            self._all_reduce_graph_df = filtered_df[filtered_df["execution_mode"] == "graph"].copy()
+            filtered_df = filtered_df[filtered_df["execution_mode"] == "eager"].copy()
 
         logger.debug(
             f"Loaded all_reduce data: {len(df)} total rows, "
@@ -825,6 +840,24 @@ class VidurCCBackend(BaseCCBackend):
     # ========================================================================
     # Prediction Methods (BaseCCBackend interface implementation)
     # ========================================================================
+
+    def predict_allreduce_for_execution_mode(self, *, execution_mode, **kwargs):
+        """Select measured graph communication without changing legacy tables."""
+        if execution_mode != "graph" or "all_reduce_graph" not in self._models:
+            return self.predict_allreduce(**kwargs)
+        size, devices = kwargs["data_size_bytes"], kwargs["num_devices"]
+        self._validate_data_size(size)
+        self._validate_num_devices(devices, "allreduce")
+        if devices <= 1:
+            return 0.0
+        tokens = max(1, size // 2)
+        cached = self._predictions["all_reduce_graph"].get((tokens,))
+        if cached is not None:
+            return max(0.0, cached)
+        result = self._predict_out_of_grid("all_reduce_graph", tokens)
+        if result is None:
+            raise RuntimeError("Mode-tagged all-reduce profile has no graph prediction")
+        return result
 
     def predict_allreduce(
         self,

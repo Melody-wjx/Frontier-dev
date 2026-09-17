@@ -1375,14 +1375,14 @@ class Simulator:
             # Kick off the scheduling process.
             self._add_event(GlobalScheduleEvent(0))
         else:
+            # In disaggregated mode, a request first arrives at the prefill cluster
+            # In monolithic mode, it arrives at the monolithic cluster
+            cluster_type = (
+                ClusterType.PREFILL
+                if self._config.is_disaggregated_mode()
+                else ClusterType.MONOLITHIC
+            )
             for request in requests:
-                # In disaggregated mode, a request first arrives at the prefill cluster
-                # In monolithic mode, it arrives at the monolithic cluster
-                cluster_type = (
-                    ClusterType.PREFILL
-                    if self._config.is_disaggregated_mode()
-                    else ClusterType.MONOLITHIC
-                )
                 self._add_event(
                     RequestArrivalEvent(request.arrived_at, request, cluster_type)
                 )

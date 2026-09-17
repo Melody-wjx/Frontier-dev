@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
+import fcntl
 import gc
 import os
+import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 
@@ -64,6 +67,50 @@ _RUNTIME_NON_KV_CACHE_OVERHEAD_CACHE_LOCK = threading.Lock()
 
 _CUDART_HANDLE = None
 _CUDART_HANDLE_LOCK = threading.Lock()
+
+# Host-wide lock serializing uncached runtime profiling across processes. The
+# profiler measures device-wide free-memory deltas (torch.cuda.mem_get_info);
+# a concurrent profiler on the same host corrupts that measurement (observed
+# as a spurious negative non_torch_increase_bytes when two simulator processes
+# on the same host profiled at the same time).
+_RUNTIME_NON_KV_PROFILE_LOCK_FILE_ENV = "FRONTIER_RUNTIME_NON_KV_PROFILE_LOCK_FILE"
+_DEFAULT_RUNTIME_NON_KV_PROFILE_LOCK_FILE = os.path.join(
+    tempfile.gettempdir(), "frontier_runtime_non_kv_profile.lock"
+)
+
+
+def _resolve_runtime_non_kv_profile_lock_file() -> str:
+    override = os.environ.get(_RUNTIME_NON_KV_PROFILE_LOCK_FILE_ENV)
+    if override:
+        return override
+    return _DEFAULT_RUNTIME_NON_KV_PROFILE_LOCK_FILE
+
+
+@contextlib.contextmanager
+def _runtime_non_kv_profile_file_lock() -> Generator[None, None, None]:
+    """Hold an exclusive host-wide file lock for one GPU profiling window."""
+    lock_path = _resolve_runtime_non_kv_profile_lock_file()
+    parent = os.path.dirname(lock_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(lock_path, "a") as lock_file:
+        logger.info(
+            "[RUNTIME_NON_KV_PROFILE_LOCK] waiting for host-wide profiling lock: %s",
+            lock_path,
+        )
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            logger.info(
+                "[RUNTIME_NON_KV_PROFILE_LOCK] acquired host-wide profiling lock: %s",
+                lock_path,
+            )
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            logger.info(
+                "[RUNTIME_NON_KV_PROFILE_LOCK] released host-wide profiling lock: %s",
+                lock_path,
+            )
 
 
 @dataclass(frozen=True)
@@ -1131,14 +1178,15 @@ def estimate_non_kv_cache_profile(
     if cached is not None:
         return cached
 
-    profiled = _profile_non_kv_cache_overhead_bytes_uncached(
-        replica_config=replica_config,
-        cluster_type=cluster_type,
-        max_num_batched_tokens=max_num_batched_tokens,
-        weights_memory_bytes=weights_memory_bytes,
-        weights_memory_source=weights_memory_source,
-        nccl_buffer_config=nccl_buffer_config,
-    )
+    with _runtime_non_kv_profile_file_lock():
+        profiled = _profile_non_kv_cache_overhead_bytes_uncached(
+            replica_config=replica_config,
+            cluster_type=cluster_type,
+            max_num_batched_tokens=max_num_batched_tokens,
+            weights_memory_bytes=weights_memory_bytes,
+            weights_memory_source=weights_memory_source,
+            nccl_buffer_config=nccl_buffer_config,
+        )
 
     normalized_profiled = _normalize_profile_result(
         profiled=profiled,

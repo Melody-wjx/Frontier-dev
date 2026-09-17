@@ -183,7 +183,21 @@ class AttentionWrapper:
             allowed_ops.add(
                 _dense_profiling_op_name_by_role(AttentionOperatorRole.DECODE_KERNEL)
             )
+        if (getattr(attention_wrapper, "unified_mixed_attention", False)
+                and attention_wrapper.contains_decode):
+            allowed_ops.add(
+                _dense_profiling_op_name_by_role(AttentionOperatorRole.PREFILL_KERNEL)
+            )
         return allowed_ops
+
+    def _normalize_unified_attention_stats(self, time_stats):
+        """An empty CUDA-event scope is not a physical attention kernel."""
+        wrapper = get_attention_wrapper()
+        if getattr(wrapper, "unified_mixed_attention", False):
+            inactive = "attn_prefill" if wrapper.contains_decode else "attn_decode"
+            if inactive in time_stats:
+                time_stats[inactive] = {key: 0.0 for key in time_stats[inactive]}
+        return time_stats
 
     def _get_input_tensors(
         self,
@@ -197,11 +211,13 @@ class AttentionWrapper:
         query, key, value = self._make_qkv_tensors(total_tokens)
         # Create SequenceMetadataProxy objects corresponding to AttentionInput
         seq_metadata_list: List[SequenceMetadataProxy] = []
+        next_block = 0
+        disjoint = getattr(get_attention_wrapper(), "requires_disjoint_blocks", False)
         for _ in range(attention_input.batch_size):
             num_blocks = ceil(
                 (num_tokens_per_seq + attention_input.kv_cache_size) / self._block_size
             )
-            if num_blocks > self.max_num_blocks:
+            if next_block + num_blocks > self.max_num_blocks:
                 raise ValueError(
                     "Requested block_table size exceeds max_num_blocks: "
                     f"num_blocks={num_blocks} max_num_blocks={self.max_num_blocks}"
@@ -210,9 +226,11 @@ class AttentionWrapper:
                 is_prompt=attention_input.is_prefill,
                 total_len=num_tokens_per_seq + attention_input.kv_cache_size,
                 processed_len=attention_input.kv_cache_size,
-                block_table=list(range(num_blocks)),
+                block_table=list(range(next_block, next_block + num_blocks)),
             )
             seq_metadata_list.append(seq_metadata)
+            if disjoint:
+                next_block += num_blocks
         return seq_metadata_list, query, key, value, self.kv_cache
 
     def _get_mixed_input_tensors(
@@ -235,12 +253,14 @@ class AttentionWrapper:
         
         # Create SequenceMetadataProxy objects for each sequence
         seq_metadata_list: List[SequenceMetadataProxy] = []
+        next_block = 0
+        disjoint = getattr(get_attention_wrapper(), "requires_disjoint_blocks", False)
         for seq_len in seq_lens:
             # Calculate number of blocks needed for this sequence
             num_blocks = ceil(
                 (seq_len + mixed_input.kv_cache_size) / self._block_size
             )
-            if num_blocks > self.max_num_blocks:
+            if next_block + num_blocks > self.max_num_blocks:
                 raise ValueError(
                     "Requested block_table size exceeds max_num_blocks: "
                     f"num_blocks={num_blocks} max_num_blocks={self.max_num_blocks}"
@@ -251,9 +271,11 @@ class AttentionWrapper:
                 is_prompt=True,  # All sequences are prefill
                 total_len=seq_len + mixed_input.kv_cache_size,
                 processed_len=mixed_input.kv_cache_size,
-                block_table=list(range(num_blocks)),
+                block_table=list(range(next_block, next_block + num_blocks)),
             )
             seq_metadata_list.append(seq_metadata)
+            if disjoint:
+                next_block += num_blocks
         
         return seq_metadata_list, query, key, value, self.kv_cache
 
@@ -368,6 +390,7 @@ class AttentionWrapper:
 
             time_stats = self.time_stats_store.get_stats()
 
+        time_stats = self._normalize_unified_attention_stats(time_stats)
         get_attention_wrapper().end_forward()
 
         # Derive per-sequence stats so merged CSVs keep mixed-related columns populated
@@ -484,6 +507,7 @@ class AttentionWrapper:
 
             time_stats = self.time_stats_store.get_stats()
         
+        time_stats = self._normalize_unified_attention_stats(time_stats)
         # End forward pass
         get_attention_wrapper().end_forward()
         
@@ -558,6 +582,7 @@ class AttentionWrapper:
 
             time_stats = self.time_stats_store.get_stats()
 
+        time_stats = self._normalize_unified_attention_stats(time_stats)
         get_attention_wrapper().end_forward()
 
         result = {

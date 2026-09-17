@@ -8,6 +8,7 @@ class AttentionBackend(Enum):
     """Attention backend types for profiling."""
 
     FLASHINFER = "FLASHINFER"
+    FLASH_ATTN = "FLASH_ATTN"
     NO_OP = "NO_OP"
 
 
@@ -50,6 +51,12 @@ def get_attention_wrapper():
         )
 
         return FlashinferAttentionWrapper.get_instance()
+    elif ATTENTION_BACKEND == AttentionBackend.FLASH_ATTN:
+        from frontier.profiling.attention.backends.flash_attention_wrapper import (
+            FlashAttentionWrapper,
+        )
+
+        return FlashAttentionWrapper.get_instance()
     elif ATTENTION_BACKEND == AttentionBackend.NO_OP:
         from frontier.profiling.attention.backends.no_op_attention_wrapper import (
             NoOpAttentionWrapper,

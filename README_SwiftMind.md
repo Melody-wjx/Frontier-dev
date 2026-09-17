@@ -55,7 +55,6 @@ p.s. 同一 model_name 在 eager / kernel_only measurement family 下是**不同
 ### C. 精度相关修改（非加速，但是本分支的一部分）
 
 - **D1：Vidur cc backend 出界修复**（`vidur_cc_backend.py`）：`num_tokens > 100000`的查询不再静默回退到 600 Gbps NVLink 解析模型，改用懒构建的几何扩展网格 + 向量化 batch predict + 线性插值。agentic500 E2E MAPE 26.98% → 4.54%，无墙钟回归。
-- **decode step-wall 开关（默认关闭）**：`--decode_step_wall_table_file`（schema `swiftmind.frontier.decode_step_wall_table.v1`）允许 graph-captured pure decode batch 直接用真实 vLLM 实测整步 wall + kv 修正计时，替换框架的 KERNEL_ONLY 近似。8 组 workload 配对验证后按用户决策保留为可选项， **默认流程不启用**（仅在 agentic1000 一组全面改善，其余 workload 上原有近似的偏差与其他误差相互抵消）。
 
 ## 实验设置：workload 说明
 
@@ -137,25 +136,22 @@ E0/E1 早于 on-demand cache，无冷热之分；E12b 之后的行只报热数�
 - E2E/makespan 误差主要来自精度侧修复（D1 Vidur 出界、D2c CPU-overhead
 CUDA Graph 标定），与本分支的加速修改无关；
 - 多轮 agentic workload 的残差误差由"每轮完成后重新排队"的反馈链放大，轮数越多/并发越高误差越大（agentic1000 > agentic500 > 单轮 long60 的 E2E 反而更差是 long60 的 decode 高估无反向抵消所致）；
-- TPOT 残差（9–29%）源于 eager 算子 profile 与 CUDA Graph GT 的结构性差异；decode step-wall 开关（本分支保留、默认关）是该方向的候选修正，验证显示 仅在 agentic1000 上有全面收益。
+- 此处历史 TPOT 残差（9–29%）涉及 eager 算子 profile 与 CUDA Graph GT 的结构性差异；后续工作采用实际后端和执行模式配套的算子、通信及 CPU profile，继续保留算子级耗时合成。
 
 ## 文件清单
 
 ```
 frontier/cc_backend/backends/vidur_cc_backend.py            D1 出界修复 + 向量化预测
-frontier/config/config.py                                   decode step-wall 配置字段
-frontier/config/global_vars.py                              decode step-wall 全局开关
 frontier/config/quantization_manager.py                     量化因子 memoization
 frontier/entities/batch.py                                  batch 签名去重
 frontier/entities/execution_time.py                         ExecutionTime 初始化优化
 frontier/entities/request.py                                Track S 微优化
 frontier/events/global_batch_end_event.py                   日志守卫 / 诊断开关
 frontier/execution_time_predictor/sklearn_execution_time_predictor.py
-    RF 快速路径、on-demand cache、懒加载、npz 网格、decode step-wall 查表
+    RF 快速路径、on-demand cache、懒加载、npz 网格
 frontier/profiling/non_kv_cache_overhead/__init__.py        runtime 内存测量缓存
 frontier/profiling/non_kv_cache_overhead/runtime_profile_disk_cache.py  新增：磁盘 cache
 frontier/scheduler/replica_scheduler/base_replica_scheduler.py          KV 分配去重等
 frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.py  Track S 热路径
 AGENTS.md                                                   修改史（见 Modification History）
 ```
-
