@@ -657,7 +657,7 @@ class Batch(BaseEntity):
             # Verify layer-consistent grouping among non-completed requests only
             if len(non_completed_requests) > 1:
                 layer_counts = [r._completed_layer_count for r in non_completed_requests]
-                if layer_counts[0] != layer_counts[1]:
+                if len(set(layer_counts)) != 1:
                     # Provide detailed error information for debugging
                     request_details = [
                         f"req={r.id}|layer={r._completed_layer_count}|token_idx={r._current_decode_token_index}|completed={r.completed}"
