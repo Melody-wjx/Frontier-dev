@@ -24,6 +24,15 @@ from frontier.types import ClusterType, ReplicaSchedulerType
 
 
 class BaseReplicaScheduler(ABC):
+    @staticmethod
+    def _calculate_max_blocks_per_sequence(
+        max_tokens: int, block_size: int
+    ) -> int:
+        """Return the blocks required to hold a maximum-length sequence."""
+        if block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {block_size}")
+        return (max_tokens + block_size - 1) // block_size
+
     def __init__(
         self,
         replica_config: ReplicaConfig,
@@ -49,8 +58,9 @@ class BaseReplicaScheduler(ABC):
         self._af_pipeline_num_micro_batch = af_pipeline_num_micro_batch
         self._cluster_scheduler = cluster_scheduler
 
-        self._max_blocks_per_sequence = (
-            self._request_generator_config.max_tokens // self._config.block_size
+        self._max_blocks_per_sequence = self._calculate_max_blocks_per_sequence(
+            self._request_generator_config.max_tokens,
+            self._config.block_size,
         )
 
         memory_planner = MemoryPlanner(
