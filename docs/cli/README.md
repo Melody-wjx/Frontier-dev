@@ -221,8 +221,21 @@ Use trace replay when you need shared-prefix or known-arrival behavior.
 | `--random_forrest_execution_time_predictor_config_atten_input_file` | Path to `attention.csv`. |
 | `--random_forrest_execution_time_predictor_config_moe_input_file` | Path to `moe.csv`. Required for MoE non-dummy runs. |
 | `--random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling` | Skip CPU overhead predictor modeling for lightweight CSV smoke runs. |
+| `--random_forrest_execution_time_predictor_config_prediction_ood_policy` | Handling for features outside the profiling range: `clip` (default), `error`, or `warn`. |
 
 When dummy mode is disabled, Frontier checks the predictor cache. If a needed model is missing, it trains from the configured CSVs and writes the trained estimator into the cache directory.
+
+Frontier stores the finite minimum and maximum of every training feature and
+checks both startup-time lookup-table generation and runtime on-demand
+predictions against that envelope. The default `clip` policy maps each
+out-of-domain feature to its nearest profiled boundary, preventing a Random
+Forest from receiving an input it cannot extrapolate while allowing the
+simulation to continue. It emits a warning on first use and records coverage
+statistics. `error` enables strict fail-fast auditing; `warn` keeps the
+historical unbounded-query behavior. `get_prediction_domain_stats()` exposes
+query, out-of-domain, clipping, and per-feature violation counts for
+diagnostics. Clipping is a fallback, not a substitute for collecting profiling
+data that covers production workloads.
 
 ### Metrics output
 

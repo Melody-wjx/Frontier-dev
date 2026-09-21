@@ -2218,6 +2218,15 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=4096,
         metadata={"help": "Max tokens per request for prediction."},
     )
+    prediction_ood_policy: str = field(
+        default="clip",
+        metadata={
+            "help": (
+                "Policy when operator prediction features fall outside the "
+                "profiling-data range: 'clip' (default), 'error', or 'warn'."
+            )
+        },
+    )
     attention_decode_batching_overhead_fraction: float = field(
         default=0.1,
         metadata={"help": "Attention decode batching overhead fraction."},

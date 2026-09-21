@@ -163,6 +163,8 @@ def test_downstream_smoke_scripts_consume_explicit_profile_csvs_without_dummy_pr
     assert "--random_forrest_execution_time_predictor_config_linear_op_input_file" in dense_text
     assert "--random_forrest_execution_time_predictor_config_atten_input_file" in dense_text
     assert "--random_forrest_execution_time_predictor_config_moe_input_file" in moe_text
+    assert "--random_forrest_execution_time_predictor_config_prediction_ood_policy clip" in dense_text
+    assert "--random_forrest_execution_time_predictor_config_prediction_ood_policy clip" in moe_text
     assert "data/profiling/compute/rtx_pro_6000/qwen2_dense_test/linear_op.csv" in dense_text
     assert "data/profiling/compute/rtx_pro_6000/qwen2_dense_test/attention.csv" in dense_text
     assert "data/profiling/compute/rtx_pro_6000/Qwen3-30B-A3B-tiny/moe.csv" in moe_text

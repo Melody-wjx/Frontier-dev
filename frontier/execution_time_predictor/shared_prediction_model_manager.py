@@ -34,6 +34,7 @@ from frontier.types import ClusterType, CCBackendType, MeasurementType
 from frontier.execution_time_predictor.attention_tp_policy import (
     resolve_effective_attention_tp_size,
 )
+from frontier.execution_time_predictor.prediction_domain import compute_feature_bounds
 from frontier.execution_time_predictor.attention_dataset_contract import (
     enforce_mixed_attention_input_contract,
 )
@@ -2097,6 +2098,11 @@ class ExecutionTimePredictionModelManager:
 
         profiling_precision = self._get_profiling_precision_from_df(df)
         measurement_type = self._validate_active_measurement_type(df)
+        feature_bounds = compute_feature_bounds(
+            df,
+            feature_cols,
+            context=f"shared operator model {model_name!r}",
+        )
         model_hash = self._get_model_hash(
             model_name,
             df,
@@ -2106,6 +2112,8 @@ class ExecutionTimePredictionModelManager:
         )
         cached_model = self._load_model_from_cache(model_name, model_hash)
         if cached_model:
+            setattr(cached_model, "_frontier_feature_names", list(feature_cols))
+            setattr(cached_model, "_frontier_feature_bounds", feature_bounds)
             self._store_model_precision(model_name, profiling_precision, cached_model)
             return cached_model
 
@@ -2191,6 +2199,7 @@ class ExecutionTimePredictionModelManager:
         best_estimator = grid_search.best_estimator_
         # Persist feature metadata for runtime on-demand prediction (e.g., moe_grouped_gemm load imbalance mode).
         setattr(best_estimator, "_frontier_feature_names", list(feature_cols))
+        setattr(best_estimator, "_frontier_feature_bounds", feature_bounds)
         setattr(best_estimator, "_frontier_target_col", target_col)
         # Tie the trained estimator to its cache hash so prediction caches can include model identity.
         setattr(best_estimator, "_frontier_model_hash", model_hash)

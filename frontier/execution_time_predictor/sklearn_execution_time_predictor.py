@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pickle
+import threading
 from abc import abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -60,6 +61,10 @@ from frontier.execution_time_predictor.base_execution_time_predictor import (
 )
 from frontier.execution_time_predictor.shared_prediction_model_manager import (
     ExecutionTimePredictionModelManager,
+)
+from frontier.execution_time_predictor.prediction_domain import (
+    FeatureBounds,
+    compute_feature_bounds,
 )
 from frontier.execution_time_predictor.attention_tp_policy import (
     resolve_effective_attention_tp_size,
@@ -159,11 +164,13 @@ class _LazyCachedModel:
         lock_file: str,
         model_hash: str,
         feature_names: List[str],
+        feature_bounds: FeatureBounds,
     ) -> None:
         self._cache_file = cache_file
         self._lock_file = lock_file
         self._frontier_model_hash = model_hash
         self._frontier_feature_names = list(feature_names)
+        self._frontier_feature_bounds = dict(feature_bounds)
         self._real_model: Optional[BaseEstimator] = None
 
     @property
@@ -287,6 +294,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             metrics_config=metrics_config,
         )
 
+        self._prediction_ood_policy = self._resolve_prediction_ood_policy()
+        self._prediction_domain_stats: Dict[tuple, Dict[str, Any]] = {}
+        self._prediction_domain_warning_cache: Set[tuple] = set()
+        self._prediction_domain_stats_lock = threading.Lock()
         self._cluster_type = cluster_type
         self._model_manager = model_manager
         self._cc_backend = cc_backend  # CC Backend for communication predictions
@@ -486,6 +497,241 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             atexit.register(self._save_persisted_on_demand_cache)
         self._activate_measurement_type(self._get_default_measurement_type_for_cluster())
 
+    def _resolve_prediction_ood_policy(self) -> str:
+        policy = str(
+            getattr(
+                getattr(self, "_config", None),
+                "prediction_ood_policy",
+                "clip",
+            )
+        ).strip().lower()
+        supported = {"error", "clip", "warn"}
+        if policy not in supported:
+            raise ValueError(
+                "prediction_ood_policy must be one of "
+                f"{sorted(supported)}, got {policy!r}."
+            )
+        return policy
+
+    def _record_prediction_domain_queries(
+        self,
+        *,
+        family_name: str,
+        model_name: str,
+        source: str,
+        total_queries: int,
+        out_of_domain_queries: int,
+        violations: Dict[str, Dict[str, Any]],
+        clipped: bool,
+    ) -> None:
+        lock = getattr(self, "_prediction_domain_stats_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._prediction_domain_stats_lock = lock
+
+        with lock:
+            stats_by_key = getattr(self, "_prediction_domain_stats", None)
+            if stats_by_key is None:
+                stats_by_key = {}
+                self._prediction_domain_stats = stats_by_key
+            stats = stats_by_key.setdefault(
+                (family_name, model_name, source),
+                {
+                    "family": family_name,
+                    "model": model_name,
+                    "source": source,
+                    "policy": getattr(
+                        self,
+                        "_prediction_ood_policy",
+                        self._resolve_prediction_ood_policy(),
+                    ),
+                    "total_queries": 0,
+                    "out_of_domain_queries": 0,
+                    "clipped_queries": 0,
+                    "feature_violations": {},
+                },
+            )
+            stats["total_queries"] += int(total_queries)
+            stats["out_of_domain_queries"] += int(out_of_domain_queries)
+            if clipped:
+                stats["clipped_queries"] += int(out_of_domain_queries)
+
+            feature_stats = stats["feature_violations"]
+            for feature_name, violation in violations.items():
+                current = feature_stats.setdefault(
+                    feature_name,
+                    {
+                        "profile_min": violation["profile_min"],
+                        "profile_max": violation["profile_max"],
+                        "below_count": 0,
+                        "above_count": 0,
+                    },
+                )
+                current["below_count"] += int(violation["below_count"])
+                current["above_count"] += int(violation["above_count"])
+
+    def get_prediction_domain_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return a snapshot of profiling-domain coverage seen by the predictor."""
+        lock = getattr(self, "_prediction_domain_stats_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            stats = copy.deepcopy(getattr(self, "_prediction_domain_stats", {}))
+        return {
+            f"{family}:{model}:{source}": values
+            for (family, model, source), values in stats.items()
+        }
+
+    def _apply_prediction_domain_policy(
+        self,
+        *,
+        model_name: str,
+        model: BaseEstimator,
+        features: pd.DataFrame,
+        source: str,
+        family_name: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Validate model inputs against profiling bounds and apply the OOD policy."""
+        feature_bounds = getattr(model, "_frontier_feature_bounds", None)
+        if not feature_bounds:
+            # Models trained by Frontier carry this metadata. Keeping legacy or
+            # test estimators usable avoids inventing a domain that cannot be
+            # recovered from an sklearn model alone.
+            return features
+
+        if family_name is None:
+            family_name = self._measurement_family_name(
+                getattr(self, "_active_measurement_type", None)
+            )
+
+        if features.empty:
+            self._record_prediction_domain_queries(
+                family_name=family_name,
+                model_name=model_name,
+                source=source,
+                total_queries=0,
+                out_of_domain_queries=0,
+                violations={},
+                clipped=False,
+            )
+            return features
+
+        missing_columns = [name for name in feature_bounds if name not in features]
+        if missing_columns:
+            raise ValueError(
+                f"Prediction features for {model_name} are missing profiling-domain "
+                f"columns: {missing_columns}."
+            )
+
+        violations: Dict[str, Dict[str, Any]] = {}
+        out_of_domain_rows = np.zeros(len(features), dtype=bool)
+        for feature_name, raw_bounds in feature_bounds.items():
+            profile_min, profile_max = map(float, raw_bounds)
+            if not math.isfinite(profile_min) or not math.isfinite(profile_max):
+                raise ValueError(
+                    "Operator model has non-finite profiling bounds: "
+                    f"model={model_name}, feature={feature_name}, "
+                    f"bounds={raw_bounds!r}."
+                )
+            if profile_min > profile_max:
+                raise ValueError(
+                    "Operator model has an inverted profiling domain: "
+                    f"model={model_name}, feature={feature_name}, "
+                    f"bounds={raw_bounds!r}."
+                )
+            values = np.asarray(features[feature_name], dtype=np.float64)
+            if not bool(np.isfinite(values).all()):
+                raise ValueError(
+                    "Operator prediction received a non-finite feature: "
+                    f"model={model_name}, feature={feature_name}."
+                )
+
+            query_min = float(values.min())
+            query_max = float(values.max())
+            below_count = int(np.count_nonzero(values < profile_min))
+            above_count = int(np.count_nonzero(values > profile_max))
+            if below_count == 0 and above_count == 0:
+                continue
+
+            out_of_domain_rows |= (values < profile_min) | (values > profile_max)
+            violations[feature_name] = {
+                "profile_min": profile_min,
+                "profile_max": profile_max,
+                "query_min": query_min,
+                "query_max": query_max,
+                "below_count": below_count,
+                "above_count": above_count,
+            }
+
+        policy = getattr(self, "_prediction_ood_policy", None)
+        if policy is None:
+            policy = self._resolve_prediction_ood_policy()
+            self._prediction_ood_policy = policy
+        out_of_domain_count = int(np.count_nonzero(out_of_domain_rows))
+        self._record_prediction_domain_queries(
+            family_name=family_name,
+            model_name=model_name,
+            source=source,
+            total_queries=len(features),
+            out_of_domain_queries=out_of_domain_count,
+            violations=violations,
+            clipped=bool(violations) and policy == "clip",
+        )
+
+        if not violations:
+            return features
+
+        details = "; ".join(
+            (
+                f"{name}: query=[{item['query_min']:g}, {item['query_max']:g}], "
+                f"profile=[{item['profile_min']:g}, {item['profile_max']:g}], "
+                f"below={item['below_count']}, above={item['above_count']}"
+            )
+            for name, item in violations.items()
+        )
+        message = (
+            "Operator prediction is outside the profiling domain: "
+            f"model={model_name}, family={family_name}, source={source}, "
+            f"queries={out_of_domain_count}/{len(features)}; {details}. "
+            "Expand profiling coverage for accurate predictions."
+        )
+        if policy == "error":
+            raise ValueError(
+                f"{message} Set prediction_ood_policy to 'clip' or 'warn' "
+                "only if approximation is acceptable."
+            )
+
+        warning_key = (
+            family_name,
+            model_name,
+            source,
+            policy,
+            tuple(sorted(violations)),
+        )
+        warning_cache = getattr(self, "_prediction_domain_warning_cache", None)
+        if warning_cache is None:
+            warning_cache = set()
+            self._prediction_domain_warning_cache = warning_cache
+        if warning_key not in warning_cache:
+            action = (
+                "Clipping to the profiling boundary."
+                if policy == "clip"
+                else "Continuing with an out-of-domain estimate."
+            )
+            logger.warning("%s %s", message, action)
+            warning_cache.add(warning_key)
+
+        if policy == "warn":
+            return features
+
+        clipped_features = features.copy()
+        for feature_name, raw_bounds in feature_bounds.items():
+            profile_min, profile_max = map(float, raw_bounds)
+            clipped_features[feature_name] = clipped_features[feature_name].clip(
+                lower=profile_min,
+                upper=profile_max,
+            )
+        return clipped_features
 
     @staticmethod
     def _validate_positive_scale(scale: float, field_name: str) -> float:
@@ -2813,7 +3059,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         pass
 
     def _get_model_hash(self, model_name: str, df: pd.DataFrame = None) -> str:
-        config_str = str(self.to_dict())
+        # OOD handling changes runtime semantics after lookup, not the trained
+        # estimator. OOD is added separately to prediction-cache identities.
+        model_config = self.to_dict()
+        model_config.pop("prediction_ood_policy", None)
+        config_str = str(model_config)
 
         if df is None:
             combined_str = f"{config_str}_{model_name}_{self._active_measurement_type.value}"
@@ -2839,7 +3089,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             return model
 
     def _load_model_from_cache_lazy(
-        self, model_name: str, model_hash: str, feature_cols: List[str]
+        self,
+        model_name: str,
+        model_hash: str,
+        feature_cols: List[str],
+        feature_bounds: FeatureBounds,
     ) -> Optional[BaseEstimator]:
         """Return a deferred-loading proxy for the cached model, if present.
 
@@ -2863,6 +3117,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 lock_file=f"{self._cache_dir}/{model_hash}_model_lock.file",
                 model_hash=model_hash,
                 feature_names=feature_cols,
+                feature_bounds=feature_bounds,
             )
 
     def _store_model_in_cache(
@@ -2924,10 +3179,18 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"(target={target_col})."
             )
 
+        feature_bounds = compute_feature_bounds(
+            df,
+            feature_cols,
+            context=f"operator model {model_name!r}",
+        )
         model_hash = self._get_model_hash(model_name, df)
 
         cached_model = self._load_model_from_cache_lazy(
-            model_name, model_hash, feature_cols
+            model_name,
+            model_hash,
+            feature_cols,
+            feature_bounds,
         )
         if cached_model is not None:
             return cached_model
@@ -2964,6 +3227,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # Attach model identity so prediction cache can stay in sync with the actual estimator.
         setattr(best_estimator, "_frontier_model_hash", model_hash)
         setattr(best_estimator, "_frontier_feature_names", list(feature_cols))
+        setattr(best_estimator, "_frontier_feature_bounds", feature_bounds)
 
         self._store_model_in_cache(model_name, model_hash, best_estimator)
 
@@ -3060,12 +3324,21 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             except Exception:
                 model_identity = "no_model_hash"
 
-        combined = f"{config_hash}_{model_identity}"
+        ood_policy = getattr(
+            self, "_prediction_ood_policy", self._resolve_prediction_ood_policy()
+        )
+        combined = f"{config_hash}_{model_identity}_ood-{ood_policy}"
         return hashlib.md5(combined.encode("utf-8")).hexdigest()[0:8]
 
     def _get_model_prediction(
         self, model_name: str, model: BaseEstimator, X: pd.DataFrame
     ) -> Dict[Tuple, float]:
+        prediction_X = self._apply_prediction_domain_policy(
+            model_name=model_name,
+            model=model,
+            features=X,
+            source="precompute",
+        )
         prediction_hash = self._get_prediction_cache_hash(model_name, model)
 
         predictions = self._load_model_predication_cache(model_name, prediction_hash)
@@ -3076,7 +3349,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         model = self._models[model_name]
         X = X.copy()
-        predictions_array = model.predict(X)
+        predictions_array = model.predict(prediction_X)
 
         # turn this into a dict, so we can store use it as a cache
         # the key is tuple for each row of X
@@ -4334,8 +4607,12 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         model_hash = getattr(model, "_frontier_model_hash", None) if model is not None else None
         if model_hash is None:
             return None
-        model_cache = self._persisted_on_demand_cache.get(
-            (family_name, model_name, model_hash)
+        ood_policy = getattr(
+            self, "_prediction_ood_policy", self._resolve_prediction_ood_policy()
+        )
+        persisted_cache = getattr(self, "_persisted_on_demand_cache", {})
+        model_cache = persisted_cache.get(
+            (family_name, model_name, model_hash, ood_policy)
         )
         if model_cache is None:
             return None
@@ -4352,8 +4629,15 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         model_hash = getattr(model, "_frontier_model_hash", None) if model is not None else None
         if model_hash is None:
             return
-        self._persisted_on_demand_cache.setdefault(
-            (family_name, model_name, model_hash), {}
+        ood_policy = getattr(
+            self, "_prediction_ood_policy", self._resolve_prediction_ood_policy()
+        )
+        persisted_cache = getattr(self, "_persisted_on_demand_cache", None)
+        if persisted_cache is None:
+            persisted_cache = {}
+            self._persisted_on_demand_cache = persisted_cache
+        persisted_cache.setdefault(
+            (family_name, model_name, model_hash, ood_policy), {}
         )[cache_key] = prediction
 
     def _rf_fast_predict(
@@ -4392,6 +4676,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             return None
 
         fast_key = (family_name, model_name)
+        if not hasattr(self, "_rf_fast_trees"):
+            # Some lightweight callers construct a predictor around an
+            # already-trained estimator without running full initialization.
+            self._rf_fast_trees = {}
 
         if fast_key not in self._rf_fast_trees:
             try:
@@ -4450,10 +4738,6 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         family_name = self._measurement_family_name(self._active_measurement_type)
 
-        # Check runtime cache first
-        if cache_key in self._runtime_cache[family_name][model_name]:
-            return self._runtime_cache[family_name][model_name][cache_key]
-
         # Get model from predictions dict
         model_info = self._predictions.get(model_name)
         if model_info is None:
@@ -4480,7 +4764,28 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"Provided keys: {sorted(list(features.keys()))}"
             )
 
-        feature_key = tuple(float(features[fn]) for fn in feature_names)
+        raw_feature_values = [float(features[fn]) for fn in feature_names]
+        feature_vector = pd.DataFrame(
+            [raw_feature_values],
+            columns=feature_names,
+        )
+        if model is not None:
+            feature_vector = self._apply_prediction_domain_policy(
+                model_name=model_name,
+                model=model,
+                features=feature_vector,
+                source="runtime",
+                family_name=family_name,
+            )
+        feature_values = [float(value) for value in feature_vector.iloc[0]]
+        feature_key = tuple(feature_values)
+
+        # Validate the current query before returning any in-memory or
+        # cross-run cached value; a previously cached extrapolation must not
+        # bypass a newly selected strict policy.
+        if cache_key in self._runtime_cache[family_name][model_name]:
+            return self._runtime_cache[family_name][model_name][cache_key]
+
         exact_lookup = model_info.get("_exact_lookup") or {}
         if feature_key in exact_lookup:
             prediction = float(exact_lookup[feature_key])
@@ -4499,19 +4804,12 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             self._runtime_cache[family_name][model_name][cache_key] = persisted
             return persisted
 
-        feature_values = [float(features[fn]) for fn in feature_names]
-
         # Fast path for RandomForest models (numerically self-validated on
         # first use); falls back to the standard sklearn predict path.
         prediction = self._rf_fast_predict(
             family_name, model_name, model, feature_values, feature_names
         )
         if prediction is None:
-            feature_vector = pd.DataFrame(
-                [feature_values],
-                columns=feature_names,
-            )
-
             # Make prediction
             try:
                 prediction = float(model.predict(feature_vector)[0])
@@ -6526,6 +6824,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "pp_producer_send_path_input_file": self._pp_producer_send_path_input_file,
             "pp_prefill_consumer_active_input_file": self._pp_prefill_consumer_active_input_file,
             "prediction_max_prefill_chunk_size": self._config.prediction_max_prefill_chunk_size,
+            "prediction_ood_policy": getattr(
+                self, "_prediction_ood_policy", self._resolve_prediction_ood_policy()
+            ),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }

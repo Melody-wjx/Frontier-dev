@@ -8,6 +8,8 @@
 # Default checked-in profiles:
 #   data/profiling/compute/rtx_pro_6000/qwen2_dense_test/linear_op.csv
 #   data/profiling/compute/rtx_pro_6000/qwen2_dense_test/attention.csv
+# These tiny structural-smoke fixtures are intentionally sparse, so this
+# wrapper opts into boundary clipping rather than claiming accuracy coverage.
 # =============================================================================
 
 set -euo pipefail
@@ -136,6 +138,7 @@ CMD=(
   --random_forrest_execution_time_predictor_config_linear_op_input_file "$LINEAR_OP_CSV"
   --random_forrest_execution_time_predictor_config_atten_input_file "$ATTENTION_CSV"
   --random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size 1024
+  --random_forrest_execution_time_predictor_config_prediction_ood_policy clip
   --random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling
   --metrics_config_output_dir "$METRICS_OUTPUT_DIR"
   --metrics_config_run_id "$RUN_ID"
