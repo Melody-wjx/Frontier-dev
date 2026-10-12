@@ -48,6 +48,60 @@ Keep this layout when adding new datasets. The E2E simulator and training code u
 
 ## Operator Coverage
 
+### Native compiled execution profiles (opt-in)
+
+The isolated linear microbenchmarks do not guarantee the same implementation as
+an Inductor-compiled vLLM model. Matching model dimensions and precision is not
+enough to establish that correspondence. For audited vLLM **0.10.2**, the new
+producer measures the model's own captured FULL-decode graph instead:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -B -m frontier.profiling.compiled_forward \
+  --model-dir /path/to/Qwen2.5-Coder-7B \
+  --output-dir /path/to/fresh/compiled-profile \
+  --tensor-parallel-size 2 \
+  --batch-sizes 1 3 8 16 32 --prompt-tokens 512 4096
+```
+
+Run in the GPU/vLLM environment on idle devices. The producer does not stop
+other GPU users. It accepts synthetic shape grids, **not workload/TTFT ground
+truth**. Current audited scope is ordinary dense, unquantized text decode,
+FlashAttention, synchronous scheduling, DP=1/PP=1, FULL CUDA Graph. Other modes
+are not silently approximated.
+
+The producer prepares KV via real vLLM requests and profiles repeated native
+graph replays on buffers frozen at a matching live decode batch, not its
+draining tail. It checks exact Forward output
+equivalence and records active requests, capture padding, query lengths and
+visible KV lengths. These are warm frozen-buffer measurements, not the online
+serving step or an estimate of CPU/GPU overlap.
+
+`profile.json` contains:
+
+- Package/CUDA/hardware/model-config identity, actual compilation configuration,
+  graph mode, compiled artifact hashes and physical kernel signatures.
+- Explicit timing boundaries: embedding, transformer blocks, cache writes,
+  TP collectives and final norm are included; scheduling, input preparation,
+  logits, sampling, output processing and RPC are excluded.
+- Unprofiled CUDA-event stream intervals and separate CUPTI GPU-activity sums.
+  They are different quantities; GPU activity sums are not a critical-path
+  formula, and per-rank durations must not be added across TP ranks.
+- Exclusive physical-kernel ledgers. Fused kernels remain fused; unknown names
+  are retained, not guessed into legacy operator categories. Missing graph
+  correlation, duplicate records or changing activity counts fail validation.
+
+`load_profile(path, expected_contract)` from
+`frontier.profiling.execution_contract` verifies the artifact checksum and
+complete declared execution contract. Passing a legacy linear/block boundary
+is rejected. **This artifact is not a legacy training CSV and is not consumed
+automatically by the simulator.** A future predictor integration must explicitly
+handle its boundary; adding the existing attention/communication/endpoints on
+top would double-count work. Merely recording metadata does not improve timing.
+
+The old profiler, profile datasets, prediction caches, simulator defaults and
+`RecordFunctionTracer` are unchanged. Omitting this explicit CLI is the complete
+runtime rollback; generated profiles are kept separate from existing CSVs.
+
 | Operator class | Example script | Output file | Use |
 |----------------|----------------|-------------|-----|
 | `linear_op` | `examples/profiling/profile_linear_op.sh` | `linear_op.csv` | Dense linear operators, projections, LayerNorm, residual add, and replicated ops. |
