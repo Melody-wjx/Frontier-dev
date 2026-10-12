@@ -499,6 +499,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             self._load_persisted_on_demand_cache()
             atexit.register(self._save_persisted_on_demand_cache)
         self._activate_measurement_type(self._get_default_measurement_type_for_cluster())
+        self._load_step_calibration_table()
 
     def _resolve_prediction_ood_policy(self) -> str:
         policy = str(
@@ -563,6 +564,128 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         self._ray_comm_time_zeroed = zeroed
         return zeroed
+
+    def _step_calibration_enabled(self) -> bool:
+        """Whether the closed-loop engine-step CPU calibration is active."""
+        return bool(getattr(self._config, "calibration_enabled", False))
+
+    def _load_step_calibration_table(self) -> None:
+        """Load per-shape engine-step wall residuals for CPU-overhead scaling.
+
+        Each calibration record maps an observed step shape
+        ``(batch_size, num_prefill_tokens, num_decode_tokens)`` to the measured
+        non-model engine-step wall residual
+        ``engine_step_wall - model_execution_e2e_wall`` (the part of the step
+        that is not GPU model execution), plus the summed named thread-CPU
+        envelope ``mapper_step_cpu_envelope`` that Frontier currently bills.
+        The scaling factor is ``residual / cpu_envelope`` and rescales the five
+        named CPU-overhead components so that their sum matches the measured
+        non-model wall residual instead of over-counting thread CPU that
+        overlaps GPU execution.
+        """
+        self._step_calibration_by_shape: Dict[
+            Tuple[int, int, int], Tuple[float, float]
+        ] = {}
+        self._step_calibration_loaded = False
+        if not self._step_calibration_enabled():
+            return
+        file_path = str(
+            getattr(self._config, "calibration_file", "") or ""
+        ).strip()
+        if not file_path:
+            logger.warning(
+                "calibration_enabled is true but no "
+                "calibration_file was provided; CPU overhead "
+                "will be billed without engine-step calibration."
+            )
+            return
+        if not os.path.exists(file_path):
+            logger.warning(
+                "CPU overhead engine-step calibration file not found: %s. "
+                "CPU overhead will be billed without engine-step calibration.",
+                file_path,
+            )
+            return
+
+        table: Dict[Tuple[int, int, int], Tuple[float, float]] = {}
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    identity = record.get("identity", {})
+                    shape = identity.get("shape", {})
+                    boundaries = record.get("engine_boundaries_ms", {})
+                    components = record.get("components_ms", {})
+                    try:
+                        key = (
+                            int(shape.get("batch_size", 0)),
+                            int(shape.get("num_prefill_tokens", 0)),
+                            int(shape.get("num_decode_tokens", 0)),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    residual = boundaries.get("engine_step_wall")
+                    model_e2e = boundaries.get("model_execution_e2e_wall")
+                    cpu_envelope = components.get("mapper_step_cpu_envelope")
+                    if residual is None or model_e2e is None:
+                        continue
+                    residual = float(residual) - float(model_e2e)
+                    cpu_envelope = (
+                        float(cpu_envelope) if cpu_envelope is not None else 0.0
+                    )
+                    if cpu_envelope <= 0 or residual <= 0:
+                        # A zero/negative residual means the shape carries no
+                        # evidence of a positive non-model step wall, which is
+                        # almost always a single-observation measurement
+                        # artifact. Fail closed to the uncalibrated path
+                        # (k=1) rather than erasing CPU overhead on weak
+                        # evidence.
+                        continue
+                    # Collapse repeated observations of the same shape via the
+                    # median residual (robust to capture outliers).
+                    table.setdefault(key, []).append((residual, cpu_envelope))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Failed to load CPU overhead engine-step calibration file %s: %s. "
+                "CPU overhead will be billed without engine-step calibration.",
+                file_path,
+                exc,
+            )
+            return
+
+        self._step_calibration_by_shape = {
+            key: (
+                float(np.median([row[0] for row in rows])),
+                float(np.median([row[1] for row in rows])),
+            )
+            for key, rows in table.items()
+        }
+        self._step_calibration_loaded = True
+        logger.info(
+            "Loaded %d CPU-overhead engine-step calibration shapes from %s",
+            len(self._step_calibration_by_shape),
+            file_path,
+        )
+
+    def _get_step_calibration_scale(self, batch: Batch) -> float:
+        """Return the CPU-overhead scaling factor for a batch, or 1.0."""
+        if not getattr(self, "_step_calibration_loaded", False):
+            return 1.0
+        features = self._get_cpu_overhead_features(batch)
+        key = (
+            int(features["batch_size"]),
+            int(features["num_prefill_tokens"]),
+            int(features["num_decode_tokens"]),
+        )
+        residual, envelope = self._step_calibration_by_shape.get(key, (0.0, 0.0))
+        if envelope <= 0:
+            return 1.0
+        scale = residual / envelope
+        # Guard against degenerate scaling from noisy single-observation shapes.
+        return float(np.clip(scale, 0.0, 2.0))
 
     def _record_prediction_domain_queries(
         self,
@@ -3110,12 +3233,17 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         pass
 
     def _get_model_hash(self, model_name: str, df: pd.DataFrame = None) -> str:
-        # OOD handling changes runtime semantics after lookup, not the trained
-        # estimator. OOD is added separately to prediction-cache identities.
+        # OOD handling, ray_comm billing, and engine-step CPU calibration all
+        # change runtime semantics after lookup, not the trained estimator.
+        # OOD is added separately to prediction-cache identities; ray_comm
+        # billing and engine-step calibration happen after lookup and belong in
+        # no estimator or prediction cache identity.
         model_config = self.to_dict()
         model_config.pop("prediction_ood_policy", None)
         model_config.pop("cpu_overhead_ray_comm_policy", None)
         model_config.pop("ray_comm_time_zeroed", None)
+        model_config.pop("calibration_enabled", None)
+        model_config.pop("calibration_shapes", None)
         config_str = str(model_config)
 
         if df is None:
@@ -6888,6 +7016,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 self._resolve_cpu_overhead_ray_comm_policy(),
             ),
             "ray_comm_time_zeroed": self._should_zero_ray_comm_time(),
+            "calibration_enabled": self._step_calibration_enabled(),
+            "calibration_shapes": len(
+                getattr(self, "_step_calibration_by_shape", {})
+            ),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }
@@ -7986,6 +8118,15 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ray_comm_time = self._validate_prediction_value(
             self._get_ray_comm_time(batch), "ray_comm", batch, f"stage={stage_id}"
         )
+
+        if self._step_calibration_enabled():
+            step_scale = self._get_step_calibration_scale(batch)
+            schedule_time *= step_scale
+            sampler_time *= step_scale
+            prepare_inputs_time *= step_scale
+            process_outputs_time *= step_scale
+            ray_comm_time *= step_scale
+
         pp_producer_send_path_runtime_time = self._validate_prediction_value(
             self._get_pp_producer_send_path_runtime_time(batch, stage_id),
             "pp_producer_send_path_runtime",

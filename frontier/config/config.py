@@ -2650,6 +2650,36 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
             )
         },
     )
+    calibration_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable closed-loop engine-step calibration for the five named "
+                "CPU-overhead components (schedule, sampler, prepare_inputs, "
+                "process_model_outputs, ray_comm). When enabled, each per-step "
+                "shape's summed thread-CPU time is rescaled to the measured "
+                "non-model engine-step wall residual "
+                "(engine_step_wall - model_execution_e2e_wall) recorded in the "
+                "profile calibration file, removing the part of the named CPU "
+                "thread time that overlaps GPU execution. Disabled by default "
+                "to preserve historical numerics."
+            )
+        },
+    )
+    calibration_file: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Path to the measured per-step CPU-overhead calibration file "
+                "produced by the vLLM runtime hook aggregation "
+                "(cpu_overhead_measurements.jsonl). Each record carries "
+                "identity.shape (batch_size, num_prefill_tokens, "
+                "num_decode_tokens) and engine_boundaries_ms "
+                "(engine_step_wall, model_execution_e2e_wall). Ignored unless "
+                "calibration_enabled is true."
+            )
+        },
+    )
     # Dummy mode configuration for fast testing and development
     enable_dummy_mode: bool = field(
         default=False,
