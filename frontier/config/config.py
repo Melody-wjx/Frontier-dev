@@ -2235,6 +2235,18 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=False,
         metadata={"help": "Experimental: use stable exact-shape CSV medians for dense GEMMs; unmeasured shapes retain original predictions. Disabled by default."},
     )
+    full_graph_decode_attention_enabled: bool = field(
+        default=False,
+        metadata={"help": "Experimental: use active/capture-aware FA2 FULL-graph pure-decode attention profiles; missing shapes retain the original predictor. Disabled by default."},
+    )
+    full_graph_decode_attention_profile: Optional[str] = field(
+        default=None,
+        metadata={"help": "Separate JSON profile produced by frontier.profiling.attention.full_graph_decode; never replaces the legacy CSV."},
+    )
+    full_graph_decode_attention_max_model_len: int = field(
+        default=0,
+        metadata={"help": "Explicit serving max_model_len used at FULL graph capture; must match the profile. Required when full_graph_decode_attention_enabled is true."},
+    )
     attention_prefill_batching_overhead_fraction: float = field(
         default=0.1,
         metadata={"help": "Attention prefill batching overhead fraction."},
@@ -6053,6 +6065,7 @@ class SimulationConfig(ABC):
         self._validate_thinking_mode_config()
         self._validate_sequential_checkpoint_observer_config()
         self._validate_monolithic_moe_stage_aggregation_config()
+        self._validate_full_graph_decode_attention_config()
 
         global_vars.set_global_vars(self.simulation_mode, self.sys_arch)
         global_vars.set_monolithic_moe_stage_aggregation(
@@ -6096,6 +6109,18 @@ class SimulationConfig(ABC):
         )
         self._normalize_metrics_output_dir()
         self.write_config_to_file()
+
+    def _validate_full_graph_decode_attention_config(self) -> None:
+        predictor = getattr(self.cluster_config, "execution_time_predictor_config", None)
+        if not getattr(predictor, "full_graph_decode_attention_enabled", False):
+            return
+        if self.sys_arch != "co-location":
+            raise ValueError("FULL graph attention overlay currently supports co-location only")
+        actual_limit = getattr(self.request_generator_config, "max_tokens", None)
+        if (not predictor.full_graph_decode_attention_profile
+                or predictor.full_graph_decode_attention_max_model_len <= 0
+                or predictor.full_graph_decode_attention_max_model_len != actual_limit):
+            raise ValueError("FULL graph attention requires a profile and capture max_model_len matching the serving request-generator max_tokens")
 
     def _validate_pdaf_trace_replay_contract(self) -> None:
         """Reject deferred StepFun trace replay inputs at the PD-AF boundary."""

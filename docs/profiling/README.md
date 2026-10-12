@@ -201,6 +201,44 @@ the profiling domain or remove other predictors' coverage limitations.
 See [the CLI guide](../cli/README.md#optional-work-preserving-mixed-prefill-kv-proxy)
 for enable/disable flags, the formula, scope and the observed workload tradeoffs.
 
+## Experimental FULL Graph Decode Attention
+
+`frontier.profiling.attention.full_graph_decode` is a separate, opt-in profiler
+for the audited vLLM 0.10.2 FA2 path. It records active requests independently
+from capture slots, uses zero-length inactive slots, and fixes the capture
+sequence-length bound to the serving `max_model_len`. Q/KV heads are derived
+from the model config and TP size; there are no model-name timing coefficients.
+
+Example (from this checkout, using the dedicated GPU environment):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /localssd/frontier_vllm_0102_env/bin/python -B \
+  -m frontier.profiling.attention.full_graph_decode \
+  --model-dir /localssd/models/Qwen2.5-Coder-7B \
+  --tensor-parallel-size 2 --device-key a100 --max-model-len 32768 \
+  --max-active 32 --output-dir ../outputs/profile/full_graph_decode/qwen
+```
+
+Run only on an exclusively available GPU. The CLI does not manage other GPU
+processes. It refuses an existing output directory and writes a new
+`profile.json` (training rows), `heldout.json`, raw samples, and metadata.
+No existing attention CSV is overwritten. The grid depends on serving bounds,
+not workload arrivals or latency labels. Output checks compare active rows
+against compact eager attention within BF16 tolerance.
+
+Timings are CUDA-event stream intervals for a repeated, warm attention-only
+graph, not pure kernel sums or whole executor time. KV writes, CPU work and TP
+communication are excluded. Full-model cache effects and nonuniform contexts
+remain limitations. The predictor keeps the existing mean-KV approximation,
+interpolates only within measured context endpoints, and requires exact
+active/capture keys. Missing shapes fall back to legacy predictions; they are
+not clipped or extrapolated by this overlay. A profile identity mismatch is a
+configuration error, not an OOD fallback.
+
+The corresponding CLI switch is documented in `../cli/README.md`. This is an
+experimental path, disabled by default; operator holdout accuracy alone is not
+evidence of improved workload TTFT.
+
 ## Common Overrides
 
 | Variable / flag | Use |

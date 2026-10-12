@@ -294,6 +294,32 @@ The strategy is accepted as an optional mode, not as a universal accuracy
 improvement or a new default. It is independent of exact-profile B, CPU
 calibration and the other experimental switches. Do not stack the historical
 `SPLIT_WORK_PRESERVING_PREFILL` experiment wrapper on top of this native option.
+
+### Experimental FULL Graph attention overlay
+
+The default remains the original predictor. To opt into a separately profiled
+active/capture-aware attention table, add all three flags:
+
+```bash
+--random_forrest_execution_time_predictor_config_full_graph_decode_attention_enabled \
+--random_forrest_execution_time_predictor_config_full_graph_decode_attention_profile /absolute/path/profile.json \
+--random_forrest_execution_time_predictor_config_full_graph_decode_attention_max_model_len 32768
+```
+
+The limit must be the actual serving/capture `max_model_len`, not the longest
+request observed in a workload. This first experiment supports unquantized
+BF16 dense MONOLITHIC PP=1, with FLASH_ATTN baseline data and an audited vLLM
+0.10.2 FA2 profile. Only FULL-runtime, single-token-per-request, pure decode
+attention in the kernel-only prediction family is replaced. Mixed prefill,
+eager/PIECEWISE paths, GEMM padding, KV writes, CPU calibration and communication
+are unchanged. The existing decode batching uplift and operator scale are
+applied after the lookup exactly as before.
+
+An exit-time `full_graph_decode_attention.<pid>.json` audit records profile
+identity, exact/interpolated hits, and missing/OOD fallback counts. RF models
+and persistent RF prediction caches are not rewritten by the overlay. Disable
+`full_graph_decode_attention_enabled` (or omit its flag) to recover the legacy
+numerical path; keep the old CSVs and all unrelated settings unchanged.
 ### Metrics output
 
 | Option | Use |

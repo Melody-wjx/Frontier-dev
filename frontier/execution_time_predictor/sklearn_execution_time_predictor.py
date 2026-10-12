@@ -501,6 +501,53 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._activate_measurement_type(self._get_default_measurement_type_for_cluster())
         self._load_step_calibration_table()
         self._apply_profiled_linear_overrides(metrics_config)
+        self._load_full_graph_decode_attention(metrics_config)
+    def _load_full_graph_decode_attention(self, metrics_config) -> None:
+        self._full_graph_decode_attention = None
+        if not getattr(self._config, "full_graph_decode_attention_enabled", False):
+            return
+        if (self._enable_dummy_mode or self._model_config.is_moe
+                or self._cluster_type != ClusterType.MONOLITHIC
+                or self._replica_config.num_pipeline_stages != 1
+                or getattr(self._model_config.quantization_config, "quant_method", None) is not None
+                or self._model_config.get_default_precision().name != "BF16"
+                or not self._uses_unified_attention_profile()):
+            raise ValueError("FULL graph attention overlay requires real, unquantized BF16 dense MONOLITHIC PP=1 FLASH_ATTN profiles")
+        filename = getattr(self._config, "full_graph_decode_attention_profile", None)
+        limit = getattr(self._config, "full_graph_decode_attention_max_model_len", 0)
+        if not filename or limit <= 0:
+            raise ValueError("FULL graph attention requires an explicit profile and serving max_model_len")
+        tp = self._replica_config.attn_tensor_parallel_size
+        if self._model_config.num_q_heads % tp or self._model_config.num_kv_heads % tp:
+            raise ValueError("FULL graph attention profile requires integral Q/KV head sharding")
+        from pathlib import Path
+        from frontier.execution_time_predictor.full_graph_decode_profile import FullGraphDecodeProfile
+        self._full_graph_decode_attention = FullGraphDecodeProfile(filename, {
+            "device_key": self._replica_config.device,
+            "num_q_heads": self._model_config.num_q_heads // tp,
+            "num_kv_heads": self._model_config.num_kv_heads // tp,
+            "head_dim": self._model_config.get_head_dim(), "tensor_parallel_size": tp,
+            "block_size": self._block_size, "max_model_len": limit, "capture_seq_len": limit,
+        })
+        target = Path(metrics_config.output_dir) / f"full_graph_decode_attention.{os.getpid()}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._full_graph_decode_attention.write_report(target)
+        atexit.register(self._full_graph_decode_attention.write_report, target)
+
+    def _get_full_graph_decode_attention_time(self, batch, capture, context):
+        table = getattr(self, "_full_graph_decode_attention", None)
+        if table is None:
+            return None
+        if (batch.num_prefill_tokens != 0
+                or batch.get_decode_cuda_graph_runtime_mode() != "FULL"
+                or self._active_measurement_type != MeasurementType.KERNEL_ONLY
+                or batch.num_decode_tokens != len(batch.requests)):
+            table.stats["ineligible_runtime"] += 1
+            return None
+        # Keep the existing mean-KV and rounding semantics for this ablation.
+        # Only attention sees active/capture separately; GEMMs retain padding.
+        return table.predict(len(batch.requests), capture, context)
+
     def _apply_profiled_linear_overrides(self, metrics_config) -> None:
         # Apply after all original predictions have loaded/saved: the switch
         # cannot contaminate persistent RF caches or change estimator hashes.
@@ -3295,6 +3342,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         model_config.pop("ray_comm_time_zeroed", None)
         model_config.pop("calibration_enabled", None)
         model_config.pop("calibration_shapes", None)
+        model_config.pop("full_graph_decode_attention_enabled", None)
+        model_config.pop("full_graph_decode_attention_profile", None)
+        model_config.pop("full_graph_decode_attention_max_model_len", None)
         # This switch selects runtime keys in the same prediction table;
         # neither the trained estimator nor its precomputed grid changes.
         model_config.pop("mixed_prefill_work_preserving_kv", None)
@@ -6568,9 +6618,12 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"attention decode prediction cache not found for cluster {self._cluster_type}"
             )
 
-        raw_time = self._predictions[decode_op_name][
+        aligned_time = self._get_full_graph_decode_attention_time(
+            batch, decode_batch_size, decode_avg_kv_cache_size
+        )
+        raw_time = (aligned_time if aligned_time is not None else self._predictions[decode_op_name][
             (decode_batch_size, decode_avg_kv_cache_size)
-        ] * (
+        ]) * (
             1
             + self._attention_decode_batching_overhead_fraction
             * int(decode_batch_size > 1)
@@ -7174,6 +7227,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "calibration_shapes": len(
                 getattr(self, "_step_calibration_by_shape", {})
             ),
+            "full_graph_decode_attention_enabled": getattr(self._config, "full_graph_decode_attention_enabled", False),
+            "full_graph_decode_attention_profile": getattr(self._config, "full_graph_decode_attention_profile", None),
+            "full_graph_decode_attention_max_model_len": getattr(self._config, "full_graph_decode_attention_max_model_len", 0),
             "mixed_prefill_work_preserving_kv": getattr(self._config, "mixed_prefill_work_preserving_kv", False),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
