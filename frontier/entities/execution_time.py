@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from copy import deepcopy
+import math
 from types import MappingProxyType
 from typing import Union
 
@@ -94,6 +95,7 @@ class ExecutionTime(BaseEntity):
         mlp_operator_times: MLPOperatorTimes | None = None,
         moe_operator_times: MoEOperatorTimes | None = None,
         op_times: Mapping[str, float] | None = None,
+        serving_forward_time: float | None = None,
     ) -> None:
         self._id = ExecutionTime.generate_id()
 
@@ -432,6 +434,29 @@ class ExecutionTime(BaseEntity):
         self._mtp_terminal_overshoot_time = mtp_terminal_overshoot_time
         self._op_times = normalize_execution_op_times(merged_op_times)
         self._refresh_op_time_attr_values()
+        self._serving_forward_time = serving_forward_time
+        if serving_forward_time is not None:
+            if (is_moe or not math.isfinite(serving_forward_time) or serving_forward_time <= 0
+                    or self._get_block_execution_time() != 0
+                    or pipeline_parallel_communication_time != 0
+                    or decode_draft_proposer_time != 0 or mtp_terminal_overshoot_time != 0):
+                raise ValueError("Whole Forward must be finite, dense and exclusive of old GPU components")
+
+    @classmethod
+    def from_serving_forward(cls, forward_ms: float, num_layers: int, **cpu):
+        """Whole-model measurement, charged ONCE, with legacy CPU terms outside."""
+        return cls(num_layers_per_pipeline_stage=num_layers,
+            attention_rope_execution_time=0., attention_kv_cache_save_execution_time=0.,
+            attention_decode_execution_time=0., attention_prefill_execution_time=0.,
+            attention_layer_pre_proj_execution_time=0., attention_layer_post_proj_execution_time=0.,
+            attn_norm_time=0., mlp_norm_time=0., add_time=0.,
+            tensor_parallel_communication_time=0., pipeline_parallel_communication_time=0.,
+            expert_parallel_communication_time=0., moe_gating_time=0., moe_shuffling_time=0.,
+            is_moe=False, serving_forward_time=forward_ms, **cpu)
+
+    @property
+    def serving_forward_time(self) -> float | None:
+        return self._serving_forward_time
 
     @staticmethod
     def _merge_operator_time_sources(
@@ -1384,6 +1409,8 @@ class ExecutionTime(BaseEntity):
         Includes batch-level draft proposer and terminal MTP overshoot execution when present.
         Does not include CPU overhead (scheduling, sampling, etc.).
         """
+        if self._serving_forward_time is not None:
+            return self._serving_forward_time * 1e-3
         # Calculate per-layer block time
         single_layer_block_time = self._get_block_execution_time()
 

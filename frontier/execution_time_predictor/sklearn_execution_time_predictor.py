@@ -503,6 +503,61 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._apply_profiled_linear_overrides(metrics_config)
         self._load_full_graph_decode_attention(metrics_config)
         self._load_compiled_decode_activation(metrics_config)
+        self._load_serving_forward(metrics_config)
+
+    def _load_serving_forward(self, metrics_config) -> None:
+        self._serving_forward = None
+        if not getattr(self._config, "serving_forward_enabled", False):
+            return
+        # Dummy mode is a structural smoke path, not a measured timing model.
+        # Keep it usable without GPU profiles after the default-on adoption.
+        if self._enable_dummy_mode:
+            return
+        model, replica = self._model_config, self._replica_config
+        if (model.is_moe
+                or model.get_default_precision().name != "BF16"
+                or getattr(model.quantization_config, "quant_method", None) is not None
+                or self._cluster_type != ClusterType.MONOLITHIC or replica.num_pipeline_stages != 1
+                or replica.attn_data_parallel_size != 1 or replica.speculative_decoding_config.enabled
+                or global_vars.get_decode_cuda_graph_mode() != "full_decode_only"
+                or getattr(self._config, "compiled_decode_activation_enabled", False)
+                or getattr(self._config, "full_graph_decode_attention_enabled", False)):
+            raise ValueError("Whole Forward requires BF16 dense MONOLITHIC PP1/DP1 FULL decode, no spec/quant or partial overlays. Pass --origin_profiler to use the legacy predictor for other configurations.")
+        from pathlib import Path
+        from frontier.execution_time_predictor.serving_forward_profile import ServingForwardProfile
+        filename = self._config.serving_forward_profile
+        if not filename or not self._config.serving_forward_contract_sha256:
+            raise ValueError("Native Forward is enabled by default: provide both serving_forward_profile and serving_forward_contract_sha256 for the target runtime, or pass --origin_profiler for the legacy predictor. Profiles are never generated automatically.")
+        table = ServingForwardProfile(filename, dict(model_name=model.get_name(), device_key=replica.device,
+            num_layers=model.num_layers, embedding_dim=model.embedding_dim, mlp_hidden_dim=model.mlp_hidden_dim,
+            tp=replica.attn_tensor_parallel_size, dtype="BF16"), self._config.serving_forward_contract_sha256)
+        runtime = table.contract["runtime"]
+        expected_backend = "FlashAttentionMetadata" if self._uses_unified_attention_profile() else "FlashInferMetadata"
+        if (runtime["vllm"] != "0.10.2" or not runtime["attention_backend"].endswith(expected_backend)
+                or sorted(runtime["compilation"]["cudagraph_capture_sizes"]) != sorted(global_vars.get_cudagraph_capture_sizes() or [])):
+            raise ValueError("Whole Forward backend/capture configuration mismatch")
+        self._serving_forward = table
+        target = Path(metrics_config.output_dir)/f"serving_forward.{os.getpid()}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table.write_report(target)
+        atexit.register(table.write_report, target)
+
+    def _predict_serving_forward(self, batch, stage_id, num_layers):
+        if stage_id != 0 or num_layers != self._model_config.num_layers:
+            raise ValueError("Native whole Forward cannot be split or multiplied by layer count")
+        from frontier.execution_time_predictor.serving_forward_profile import batch_shape
+        shape = batch_shape(batch, global_vars.get_cudagraph_capture_sizes())
+        forward = self._serving_forward.predict(shape)
+        cpu = dict(schedule_time=self._get_schedule_time(batch),
+            sampler_e2e_time=self._get_sampler_e2e_time(batch),
+            prepare_inputs_e2e_time=self._get_prepare_inputs_e2e_time(batch),
+            process_model_outputs_time=self._get_process_model_outputs_time(batch),
+            ray_comm_time=self._get_ray_comm_time(batch))
+        scale = self._get_step_calibration_scale(batch) if self._step_calibration_enabled() else 1.
+        cpu = {key: self._validate_prediction_value(value, key, batch, "native_forward")*scale
+               for key,value in cpu.items()}
+        return ExecutionTime.from_serving_forward(forward, num_layers, **cpu)
+
     def _load_compiled_decode_activation(self, metrics_config) -> None:
         self._compiled_decode_activation = None
         if not getattr(self._config, "compiled_decode_activation_enabled", False):
@@ -3383,6 +3438,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         model_config.pop("compiled_decode_activation_enabled", None)
         model_config.pop("compiled_decode_activation_profile", None)
         model_config.pop("compiled_decode_activation_contract_sha256", None)
+        model_config.pop("serving_forward_enabled", None)
+        model_config.pop("serving_forward_profile", None)
+        model_config.pop("serving_forward_contract_sha256", None)
         config_str = str(model_config)
 
         if df is None:
@@ -7278,6 +7336,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "compiled_decode_activation_enabled": getattr(self._config, "compiled_decode_activation_enabled", False),
             "compiled_decode_activation_profile": getattr(self._config, "compiled_decode_activation_profile", None),
             "compiled_decode_activation_contract_sha256": getattr(self._config, "compiled_decode_activation_contract_sha256", None),
+            "serving_forward_enabled": getattr(self._config, "serving_forward_enabled", False),
+            "serving_forward_profile": getattr(self._config, "serving_forward_profile", None),
+            "serving_forward_contract_sha256": getattr(self._config, "serving_forward_contract_sha256", None),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }
@@ -8244,6 +8305,8 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._activate_measurement_type(measurement_type)
 
         # Calculate first-class communication operators for the dense live path.
+        if getattr(self, "_serving_forward", None) is not None:
+            return self._predict_serving_forward(batch, stage_id, num_layers)
         communication_operator_times: dict[str, float] = {}
         if stage_id == self._replica_config.num_pipeline_stages - 1:
             pipeline_parallel_communication_time = 0

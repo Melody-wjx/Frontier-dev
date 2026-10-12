@@ -217,6 +217,11 @@ Use trace replay when you need shared-prefix or known-arrival behavior.
 |--------|-----|
 | `--random_forrest_execution_time_predictor_config_enable_dummy_mode` | Use fixed dummy execution time. Good for smoke tests only. |
 | `--no-random_forrest_execution_time_predictor_config_enable_dummy_mode` | Use profiling-backed ML predictors. |
+| `--origin_profiler` | Select the original operator profiler/predictor; omit for the new native Forward default. |
+| `--random_forrest_execution_time_predictor_config_serving_forward_enabled` | Use whole native Forward prediction (default on for non-dummy timing). |
+| `--random_forrest_execution_time_predictor_config_serving_forward_profile` | Matching whole-Forward model JSON; required when enabled. |
+| `--random_forrest_execution_time_predictor_config_serving_forward_contract_sha256` | Expected execution-contract fingerprint; required when enabled. |
+| `--no-random_forrest_execution_time_predictor_config_serving_forward_enabled` | Compatible historical spelling of the legacy-path switch for the RF predictor; prefer `--origin_profiler`. |
 | `--random_forrest_execution_time_predictor_config_linear_op_input_file` | Path to `linear_op.csv`. |
 | `--random_forrest_execution_time_predictor_config_atten_input_file` | Path to `attention.csv`. |
 | `--random_forrest_execution_time_predictor_config_moe_input_file` | Path to `moe.csv`. Required for MoE non-dummy runs. |
@@ -241,6 +246,17 @@ ablations. Because billing occurs after prediction, this policy does not
 invalidate estimator or prediction caches. The configured policy and
 effective decision remain visible via `to_dict()`
 (`cpu_overhead_ray_comm_policy`, `ray_comm_time_zeroed`).
+
+Whole native Forward prediction is accepted and enabled by default. Supply a
+profile and contract for the runtime being simulated; Frontier does not choose
+another model's data or launch GPU profiling automatically. Missing or
+incompatible data is a configuration error, not a silent switch to old timing.
+Dummy mode remains profile-free. See the profiling guide for the audited scope.
+Legacy operator-only runs and partial activation/attention overlays use
+`--origin_profiler`. This short flag overrides long enable flags regardless of
+order; other accepted strategies remain unchanged. Replay adapters that expose
+a trailing Frontier-argument section accept it after `--`, just like native
+Frontier flags.
 
 When dummy mode is disabled, Frontier checks the predictor cache. If a needed model is missing, it trains from the configured CSVs and writes the trained estimator into the cache directory.
 

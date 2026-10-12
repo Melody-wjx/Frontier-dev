@@ -347,3 +347,61 @@ evidence of improved workload TTFT.
 | Expected CSV is missing after a run. | The profiler did not finish or wrote to a different output root. | Check `DATA_DIR_BASE`, `DEVICE`, and `MODEL`; the script prints the resolved output path. |
 | Simulator smoke fails on a missing CSV. | Required profile file is absent. | Generate the CSV or pass an explicit `--*-csv` path. |
 | MoE smoke fails on routing metadata. | Simulator routing mode does not match CSV metadata. | Align `moe_routing_mode` with the CSV `routing_runtime_path`. |
+# Accepted whole native Forward (default on)
+
+`python -m frontier.profiling.serving_forward --model-dir LOCAL_MODEL --output-dir FRESH_OUTPUT`
+profiles the installed vLLM 0.10.2 compiled model on independent synthetic decode,
+prefill (including cached history), and staggered mixed batches. Default backend:
+`FLASHINFER`; `--backend FLASH_ATTN` is explicit. Dense BF16 TP=2, PP=1/DP=1,
+32K context, 8192-token budget, block size 16, prefix caching, synchronous serving,
+and FULL-decode capture ladder `[1,2,4,8,16,32,64]` are the audited experiment scope.
+This CLI is not a general all-model/all-topology profiler.
+
+Measurements are CUDA-event **stream spans around the actual model call**, not
+kernel sums. Frozen inputs, KV and attention metadata are prepared by the real
+model runner. Warm repeats must preserve active outputs exactly. TP ranks are
+combined with the maximum per paired round, never their sum. Synthetic holdout
+points are excluded from fitting; GT request latency is not a fitting input.
+The `--tiny` supplement covers 2/4/8-token boundaries with/without cached history.
+
+The default-on predictor uses nonnegative token-size and per-request attention-work
+features. It reports sampled-feature range violations rather than clipping them.
+Being within scalar bounds is not proof that a joint shape was measured. This
+work model is a new hypothesis requiring workload validation, not a claim that
+whole-Forward profiling automatically removes prediction error.
+
+`serving_forward_enabled` requires `serving_forward_profile` and an explicit
+`serving_forward_contract_sha256`. The separate `serving_forward_time` ledger
+entry includes embeddings, transformer layers, KV writes, TP collectives and
+final norm **once per batch**. Legacy included GPU/communication terms are zero,
+not added or layer-multiplied. Scheduling, input preparation, logits/sampling,
+output/RPC work is outside the measurement. Existing CPU modeling (and its
+boundary limitations) is deliberately unchanged. Partial activation/attention
+overlays cannot be combined with this whole-Forward switch.
+
+Accepted on 2026-10-12. Non-dummy runs must provide a matching profile and
+expected contract fingerprint; there is no automatic GPU profiling, hard-coded
+Qwen data selection, or silent legacy fallback when either is missing. Dummy
+mode keeps its fixed synthetic times and does not load this profile. To select
+the original operator predictor (also required for unsupported model/topology
+settings or standalone partial overlays), pass:
+
+```bash
+--origin_profiler
+```
+
+Omit `--origin_profiler` to use the new default. The historical long on/off
+flags remain compatible; `--origin_profiler` takes precedence if combined with
+a long enable flag, irrespective of argument order. It selects the old timing
+path for whichever predictor type is chosen; it does not launch profiling or
+revert any other accepted strategy.
+The producer and prediction formulas are unchanged by this default switch.
+
+The 2026-10-09 pilot uses the frozen 28 E1–E5/C1 workloads, FlashInfer on both
+profiling and GT, B and optional KV strategy on in both arms, and the pilot's
+unscaled CPU profile in both arms. It is not directly pooled with the earlier
+six-case FlashAttention/CPU-calibrated experiment. Arrival rates have **not** been
+capacity calibrated. The user accepted this path after reviewing the completed
+pilot. Two replay cells have long audit/host-delay gaps and remain measurement
+caveats; adoption is not a claim of universal accuracy. Frozen A/B artifacts
+retain their original explicit on/off settings and are not rewritten.

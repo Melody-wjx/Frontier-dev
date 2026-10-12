@@ -157,6 +157,7 @@ def create_from_cli_args(cls) -> Any:
     This function is dynamically mapped to FlatClass as a class method.
     """
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    disable_aliases = {}
 
     for field in fields(cls):
         nargs = None
@@ -176,6 +177,18 @@ def create_from_cli_args(cls) -> Any:
             field_type = json.loads
         elif is_bool(field.type):
             action = BooleanOptionalAction
+            metadata = cls.metadata_mapping[field.name]
+            alias = metadata.get("disable_alias")
+            if alias:
+                # Inherited fields from several predictor types can share one
+                # short switch. Resolve it into the canonical fields before
+                # reconstructing configs, without adding serialized state.
+                entry = disable_aliases.setdefault(alias, {
+                    "dest": f"__disable_alias_{len(disable_aliases)}",
+                    "fields": [],
+                    "help": metadata.get("disable_alias_help"),
+                })
+                entry["fields"].append(field.name)
 
         arg_params = {
             "type": field_type,
@@ -198,9 +211,17 @@ def create_from_cli_args(cls) -> Any:
             arg_params["nargs"] = nargs
         parser.add_argument(f"--{field.name}", **arg_params)
 
-    args = parser.parse_args()
+    for alias, entry in disable_aliases.items():
+        parser.add_argument(alias, dest=entry["dest"], action="store_true",
+                            default=False, help=entry["help"])
 
-    return cls(**vars(args))
+    values = vars(parser.parse_args())
+    for entry in disable_aliases.values():
+        if values.pop(entry["dest"]):
+            for name in entry["fields"]:
+                values[name] = False
+
+    return cls(**values)
 
 
 def create_flat_dataclass(input_dataclass: Any) -> Any:

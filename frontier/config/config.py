@@ -2256,6 +2256,16 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=False,
         metadata={"help": "Experimental: use stable exact-shape CSV medians for dense GEMMs; unmeasured shapes retain original predictions. Disabled by default."},
     )
+    serving_forward_enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Use the accepted native dense PP1 GPU Forward predictor (default on). Requires a matching serving_forward_profile and serving_forward_contract_sha256; use --origin_profiler for legacy operator prediction. CPU terms remain unchanged; dummy mode does not consume profiles.",
+            "disable_alias": "--origin_profiler",
+            "disable_alias_help": "Use the original operator profiler/predictor instead of native Forward prediction. Takes precedence over the long enable flags.",
+        },
+    )
+    serving_forward_profile: Optional[str] = field(default=None)
+    serving_forward_contract_sha256: Optional[str] = field(default=None)
     compiled_decode_activation_enabled: bool = field(
         default=False,
         metadata={"help": "Experimental: replace only pure-decode SiLU×Mul kernel time with exact compiled-profile shapes. Missing shapes retain the baseline."},

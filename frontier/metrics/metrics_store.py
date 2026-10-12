@@ -3818,6 +3818,10 @@ class MetricsStore:
                 execution_time.mtp_terminal_overshoot_time
             ),
         }
+        if execution_time.serving_forward_time is not None:
+            component_ledger["serving_forward_time"] = _round_ledger_ms(
+                execution_time.serving_forward_time
+            )
         return component_ledger
 
     def _build_frontier_stage_batch_diagnostic_component_ledger(
