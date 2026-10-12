@@ -256,6 +256,44 @@ query, out-of-domain, clipping, and per-feature violation counts for
 diagnostics. Clipping is a fallback, not a substitute for collecting profiling
 data that covers production workloads.
 
+### Optional work-preserving mixed-prefill KV proxy
+
+The accepted mixed-prefill strategy is available through an independent,
+default-off switch. Add this flag to a simulation or a replay command that
+forwards Frontier predictor options:
+
+```bash
+--random_forrest_execution_time_predictor_config_mixed_prefill_work_preserving_kv
+```
+
+Omit it, or explicitly use the following flag, to select the original baseline:
+
+```bash
+--no-random_forrest_execution_time_predictor_config_mixed_prefill_work_preserving_kv
+```
+
+The dataclass field is `mixed_prefill_work_preserving_kv`. Its value is exported
+in `config.json` and predictor `to_dict()` so each run records the selected
+strategy. For a decomposed mixed prefill/decode step containing multiple prefill
+requests, let `q_i` be each request's current chunk tokens and `k_i` its historical
+KV tokens, rounded using the existing KV granularity. The option retains
+`q_eff = round(sqrt(sum(q_i**2)))` and changes the KV lookup coordinate from
+`sum(k_i)` to `ceil(sum(q_i*k_i) / q_eff / granularity) * granularity`.
+
+The option selects values from the existing prediction table; it requires no
+new profiling, retraining, or cache invalidation. If the original or replacement
+key is absent, it preserves the original prediction. The existing prefill
+batching uplift is retained. The option only affects the decomposed mixed
+helper: pure prefill, pure decode, single-prefill mixed steps and the unified
+mixed-attention path keep their existing calculations.
+
+The Qwen2.5-Coder-7B / TP2 / vLLM 0.10.2 evaluation covered 79 settings:
+TTFT MAE improved in 43, regressed in 21, and was unchanged in 15. Benefits were
+concentrated in TraceLab; some large/high-concurrency cases regressed materially.
+The strategy is accepted as an optional mode, not as a universal accuracy
+improvement or a new default. It is independent of exact-profile B, CPU
+calibration and the other experimental switches. Do not stack the historical
+`SPLIT_WORK_PRESERVING_PREFILL` experiment wrapper on top of this native option.
 ### Metrics output
 
 | Option | Use |

@@ -188,6 +188,19 @@ bash examples/profiling/smoke_simulator_moe_csv.sh \
   --run-id my_moe_csv_smoke
 ```
 
+## Optional mixed-prefill KV aggregation
+
+`mixed_prefill_work_preserving_kv` is a default-off runtime prediction option,
+not a profiling-data modification. It reuses the existing prefill prediction
+tables and their eager/kernel-only routing, with no additional measurements or
+estimator/prediction cache invalidation. It changes only the historical-KV
+coordinate used for decomposed mixed steps with multiple prefill requests.
+Missing lookup keys retain the original prediction; this option does not extend
+the profiling domain or remove other predictors' coverage limitations.
+
+See [the CLI guide](../cli/README.md#optional-work-preserving-mixed-prefill-kv-proxy)
+for enable/disable flags, the formula, scope and the observed workload tradeoffs.
+
 ## Common Overrides
 
 | Variable / flag | Use |

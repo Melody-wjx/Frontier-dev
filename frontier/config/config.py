@@ -2239,6 +2239,18 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=0.1,
         metadata={"help": "Attention prefill batching overhead fraction."},
     )
+    mixed_prefill_work_preserving_kv: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Opt-in work-preserving KV proxy for the prefill component of "
+                "decomposed mixed batches with multiple prefill requests. "
+                "Uses each request's step tokens times its own historical KV "
+                "to select the existing prediction table. Missing keys retain "
+                "the original prediction. Disabled by default."
+            )
+        },
+    )
     mixed_attention_decompose_prefill_tokens: int = field(
         default=64,
         metadata={

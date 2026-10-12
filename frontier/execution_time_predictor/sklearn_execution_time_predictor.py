@@ -3295,6 +3295,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         model_config.pop("ray_comm_time_zeroed", None)
         model_config.pop("calibration_enabled", None)
         model_config.pop("calibration_shapes", None)
+        # This switch selects runtime keys in the same prediction table;
+        # neither the trained estimator nor its precomputed grid changes.
+        model_config.pop("mixed_prefill_work_preserving_kv", None)
         config_str = str(model_config)
 
         if df is None:
@@ -4765,6 +4768,33 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         key = (agg_kv_cache_size, agg_prefill_chunk_size**2)
         if key not in self._predictions[prefill_op_name]:
             return 0.0
+        if (
+            getattr(
+                getattr(self, "_config", None),
+                "mixed_prefill_work_preserving_kv",
+                False,
+            )
+            and len(prefill_params) > 1
+            and agg_prefill_chunk_size > 0
+        ):
+            # Keep the within-chunk work proxy sum(q_i**2), and approximate
+            # history-attention work with sum(q_i * k_i). Multiplying the
+            # effective query length by sum(k_i) overcounts cross-request
+            # history. Match the accepted trial's rounding and lookup fallback.
+            effective_tokens = round(
+                math.sqrt(sum(q * q for _, q in prefill_params))
+            )
+            granularity = self._config.kv_cache_prediction_granularity
+            effective_kv = math.ceil(
+                sum(k * q for k, q in prefill_params)
+                / effective_tokens
+                / granularity
+            ) * granularity
+            trial_original_key = (agg_kv_cache_size, effective_tokens**2)
+            work_preserving_key = (effective_kv, effective_tokens**2)
+            table = self._predictions[prefill_op_name]
+            if trial_original_key in table and work_preserving_key in table:
+                key = work_preserving_key
         return self._predictions[prefill_op_name][key] * (
             1
             + self._attention_prefill_batching_overhead_fraction
@@ -7144,6 +7174,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "calibration_shapes": len(
                 getattr(self, "_step_calibration_by_shape", {})
             ),
+            "mixed_prefill_work_preserving_kv": getattr(self._config, "mixed_prefill_work_preserving_kv", False),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }
