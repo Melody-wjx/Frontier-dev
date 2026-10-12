@@ -2239,6 +2239,22 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=0.1,
         metadata={"help": "Attention prefill batching overhead fraction."},
     )
+    mixed_attention_decompose_prefill_tokens: int = field(
+        default=64,
+        metadata={
+            "help": (
+                "When a true mixed prefill+decode batch carries more prefill "
+                "tokens than this threshold, predict the decode-attention "
+                "component from the well-covered pure-decode attention table "
+                "instead of the attn_decode_in_mixed model. The mixed model's "
+                "training grid only covers prefill sequences of 2-16 tokens; "
+                "workload prefill chunks (1-8k tokens) fall far outside that "
+                "range, and the Random Forest extrapolates to boundary leaf "
+                "values that overestimate mixed attention latency by 2-3x. "
+                "Set to 0 to always use the attn_decode_in_mixed model."
+            )
+        },
+    )
     attn_pre_proj_calibration_scale: float = field(
         default=1.0,
         metadata={

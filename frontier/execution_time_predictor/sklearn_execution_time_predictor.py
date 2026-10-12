@@ -4742,6 +4742,35 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         batch._prefill_mixed_features = features
         return features
 
+    def _get_decomposed_prefill_attention_time(self, batch: Batch) -> float:
+        """Bill the prefill attention component of a decomposed mixed batch.
+
+        Used when the mixed-attention model is bypassed for out-of-range
+        prefill widths. The unified FLASH_ATTN profile folds prefill
+        attention into attn_decode_in_mixed (and the regular prefill path
+        returns 0 for unified batches), so under decomposition this helper
+        queries the pure prefill attention table directly.
+        """
+        prefill_params = self._get_batch_prefill_attention_params(batch)
+        if not prefill_params:
+            return 0.0
+        prefill_op_name = self._dense_attention_prefill_op_name()
+        if prefill_op_name not in self._predictions:
+            return 0.0
+        kv_cache_sizes, prefill_chunk_sizes = zip(*prefill_params)
+        agg_kv_cache_size = sum(kv_cache_sizes)
+        agg_prefill_chunk_size = round(
+            sum(x**2 for x in prefill_chunk_sizes) ** 0.5
+        )
+        key = (agg_kv_cache_size, agg_prefill_chunk_size**2)
+        if key not in self._predictions[prefill_op_name]:
+            return 0.0
+        return self._predictions[prefill_op_name][key] * (
+            1
+            + self._attention_prefill_batching_overhead_fraction
+            * int(len(prefill_params) > 1)
+        )
+
     def _get_batch_decode_mixed_features(self, batch: Batch) -> Dict[str, float]:
         """Extract decode-in-mixed features for true mixed prefill+decode batches."""
         if hasattr(batch, "_decode_mixed_features"):
@@ -6446,6 +6475,50 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                     "(Option A) and train attn_decode_in_mixed."
                 )
             features = self._get_batch_decode_mixed_features(batch)
+
+            # The attn_decode_in_mixed training grid only covers prefill
+            # sequences of a few tokens (2-16 in the current profile). Real
+            # workload prefill chunks (1-8k tokens) fall far outside that
+            # range and the Random Forest extrapolates to boundary leaf
+            # values, overestimating mixed attention latency by 2-3x. When
+            # the prefill width exceeds the decomposition threshold, fall
+            # back to the well-covered pure-decode attention table for the
+            # decode component; the prefill component is separately billed
+            # through _get_attention_prefill_execution_time.
+            decompose_threshold = int(
+                getattr(
+                    self._config,
+                    "mixed_attention_decompose_prefill_tokens",
+                    0,
+                )
+            )
+            total_prefill_tokens = int(features.get("total_prefill_tokens", 0))
+            decode_batch_size_mixed = int(features.get("decode_batch_size", 0))
+            decode_avg_kv_mixed = int(features.get("decode_avg_kv_cache_size", 0))
+            if (
+                decompose_threshold > 0
+                and total_prefill_tokens > decompose_threshold
+                and decode_batch_size_mixed > 0
+                and self._dense_attention_decode_op_name() in self._predictions
+                and (decode_batch_size_mixed, decode_avg_kv_mixed)
+                in self._predictions[self._dense_attention_decode_op_name()]
+            ):
+                decode_time = self._predictions[
+                    self._dense_attention_decode_op_name()
+                ][(decode_batch_size_mixed, decode_avg_kv_mixed)] * (
+                    1
+                    + self._attention_decode_batching_overhead_fraction
+                    * int(decode_batch_size_mixed > 1)
+                ) * self._get_calibration_scale(
+                    "_attn_decode_calibration_scale", "attn_decode_calibration_scale"
+                )
+                # The unified FLASH_ATTN profile folds prefill attention into
+                # the mixed model (and _get_attention_prefill_execution_time
+                # returns 0 for unified batches). Under decomposition, bill
+                # the prefill component explicitly from the prefill table.
+                prefill_time = self._get_decomposed_prefill_attention_time(batch)
+                return decode_time + prefill_time
+
             raw_time = self._get_on_demand_prediction("attn_decode_in_mixed", features)
             mixed_scale = self._get_optional_calibration_scale(
                 "_attn_decode_in_mixed_calibration_scale",
