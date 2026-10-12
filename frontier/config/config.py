@@ -2231,6 +2231,10 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=0.1,
         metadata={"help": "Attention decode batching overhead fraction."},
     )
+    prefer_profiled_linear: bool = field(
+        default=False,
+        metadata={"help": "Experimental: use stable exact-shape CSV medians for dense GEMMs; unmeasured shapes retain original predictions. Disabled by default."},
+    )
     attention_prefill_batching_overhead_fraction: float = field(
         default=0.1,
         metadata={"help": "Attention prefill batching overhead fraction."},

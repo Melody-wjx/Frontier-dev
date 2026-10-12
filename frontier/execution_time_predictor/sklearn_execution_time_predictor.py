@@ -500,6 +500,57 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             atexit.register(self._save_persisted_on_demand_cache)
         self._activate_measurement_type(self._get_default_measurement_type_for_cluster())
         self._load_step_calibration_table()
+        self._apply_profiled_linear_overrides(metrics_config)
+    def _apply_profiled_linear_overrides(self, metrics_config) -> None:
+        # Apply after all original predictions have loaded/saved: the switch
+        # cannot contaminate persistent RF caches or change estimator hashes.
+        if not getattr(self._config, "prefer_profiled_linear", False):
+            return
+        if self._enable_dummy_mode:
+            raise ValueError("prefer_profiled_linear requires real trained predictions")
+        if (self._model_config.is_moe
+                or getattr(self._model_config.quantization_config, "quant_method", None) is not None
+                or self._cluster_type != ClusterType.MONOLITHIC):
+            raise ValueError("prefer_profiled_linear currently supports unquantized dense co-location only")
+        from pathlib import Path
+        from frontier.execution_time_predictor.exact_linear_profile import (
+            LINEAR_OPERATIONS, measured_linear_points, overlay_exact_points,
+        )
+
+        report = {"enabled": True, "scope": list(LINEAR_OPERATIONS),
+                  "model": self._replica_config.model_name,
+                  "device": self._replica_config.device, "families": {}}
+        for family, lookup in ((MeasurementType.CUDA_EVENT, self._predictions_eager),
+                               (MeasurementType.KERNEL_ONLY, self._predictions_kernel_only)):
+            if not lookup:
+                continue
+            with self._temporary_measurement_type(family):
+                path = Path(self._compute_input_file)
+                frame_by_tp = {}
+                operations = {}
+                for operation in LINEAR_OPERATIONS:
+                    if operation not in lookup:
+                        continue
+                    tp = self._get_linear_op_tp_key(operation)
+                    if tp not in frame_by_tp:
+                        frame = self._load_compute_df(str(path), tensor_parallel_size=tp)
+                        metadata = self._get_profiling_metadata(frame, str(path))
+                        if (metadata.profiling_precision != self._model_config.get_default_precision()
+                                or metadata.quant_signature != "none"):
+                            raise ValueError("Exact linear profile requires matching precision and unquantized data")
+                        frame_by_tp[tp] = frame
+                    points, audit = measured_linear_points(frame_by_tp[tp], operation)
+                    lookup[operation], changes = overlay_exact_points(lookup[operation], points)
+                    operations[operation] = {"tp": tp, "quality": audit,
+                                             "overrides": changes, "overridden_keys": len(changes)}
+                report["families"][family.value] = {
+                    "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "operations": operations,
+                }
+        target = Path(metrics_config.output_dir) / f"exact_linear_profile.{self._cluster_type.name}.{os.getpid()}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, indent=2) + "\n")
+        logger.info("Applied opt-in exact linear medians; original caches unchanged; audit=%s", target)
 
     def _resolve_prediction_ood_policy(self) -> str:
         policy = str(
