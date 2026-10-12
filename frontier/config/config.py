@@ -2256,6 +2256,18 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=False,
         metadata={"help": "Experimental: use stable exact-shape CSV medians for dense GEMMs; unmeasured shapes retain original predictions. Disabled by default."},
     )
+    compiled_decode_activation_enabled: bool = field(
+        default=False,
+        metadata={"help": "Experimental: replace only pure-decode SiLU×Mul kernel time with exact compiled-profile shapes. Missing shapes retain the baseline."},
+    )
+    compiled_decode_activation_profile: Optional[str] = field(
+        default=None,
+        metadata={"help": "Exclusive compiled activation JSON; never a whole-Forward timing replacement."},
+    )
+    compiled_decode_activation_contract_sha256: Optional[str] = field(
+        default=None,
+        metadata={"help": "Explicit expected vLLM/compiler execution-contract fingerprint for the activation profile."},
+    )
     full_graph_decode_attention_enabled: bool = field(
         default=False,
         metadata={"help": "Experimental: use active/capture-aware FA2 FULL-graph pure-decode attention profiles; missing shapes retain the original predictor. Disabled by default."},

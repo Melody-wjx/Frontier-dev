@@ -502,6 +502,38 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._load_step_calibration_table()
         self._apply_profiled_linear_overrides(metrics_config)
         self._load_full_graph_decode_attention(metrics_config)
+        self._load_compiled_decode_activation(metrics_config)
+    def _load_compiled_decode_activation(self, metrics_config) -> None:
+        self._compiled_decode_activation = None
+        if not getattr(self._config, "compiled_decode_activation_enabled", False):
+            return
+        model, replica = self._model_config, self._replica_config
+        if (self._enable_dummy_mode or model.is_moe or not model.use_gated_mlp
+                or model.activation.name != "SILU" or model.get_default_precision().name != "BF16"
+                or getattr(model.quantization_config, "quant_method", None) is not None
+                or self._cluster_type != ClusterType.MONOLITHIC or replica.num_pipeline_stages != 1
+                or replica.attn_data_parallel_size != 1
+                or replica.speculative_decoding_config.enabled
+                or global_vars.get_decode_cuda_graph_mode() != "full_decode_only"):
+            raise ValueError("Compiled activation requires unquantized BF16 dense SiLU MONOLITHIC PP1/DP1 FULL decode without speculation")
+        filename = self._config.compiled_decode_activation_profile
+        contract = self._config.compiled_decode_activation_contract_sha256
+        if not filename or not contract:
+            raise ValueError("Compiled activation requires a profile and explicit execution contract fingerprint")
+        from pathlib import Path
+        from frontier.execution_time_predictor.compiled_activation_profile import CompiledActivationProfile
+        table = CompiledActivationProfile(filename, dict(model_name=model.get_name(), device_key=replica.device,
+            num_layers=model.num_layers, embedding_dim=model.embedding_dim, mlp_hidden_dim=model.mlp_hidden_dim,
+            tp=replica.attn_tensor_parallel_size, dtype="BF16"), contract)
+        captures = table.contract["runtime"]["compilation"]["cudagraph_capture_sizes"]
+        if sorted(captures) != sorted(global_vars.get_cudagraph_capture_sizes() or []):
+            raise ValueError("Compiled activation capture configuration mismatch")
+        self._compiled_decode_activation = table
+        target = Path(metrics_config.output_dir)/f"compiled_decode_activation.{os.getpid()}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table.write_report(target)
+        atexit.register(table.write_report, target)
+
     def _load_full_graph_decode_attention(self, metrics_config) -> None:
         self._full_graph_decode_attention = None
         if not getattr(self._config, "full_graph_decode_attention_enabled", False):
@@ -3348,6 +3380,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # This switch selects runtime keys in the same prediction table;
         # neither the trained estimator nor its precomputed grid changes.
         model_config.pop("mixed_prefill_work_preserving_kv", None)
+        model_config.pop("compiled_decode_activation_enabled", None)
+        model_config.pop("compiled_decode_activation_profile", None)
+        model_config.pop("compiled_decode_activation_contract_sha256", None)
         config_str = str(model_config)
 
         if df is None:
@@ -5424,7 +5459,16 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"MLP activation operation not supported for cluster {self._cluster_type}"
             )
         effective_tokens = batch.get_effective_total_tokens_rounded(self._cluster_type)
-        return self._predictions["mlp_act"][(effective_tokens,)]
+        original = self._predictions["mlp_act"][(effective_tokens,)]
+        table = getattr(self, "_compiled_decode_activation", None)
+        if table is None:
+            return original
+        if (batch.num_prefill_tokens != 0 or batch.num_decode_tokens != len(batch.requests)
+                or batch.get_decode_cuda_graph_runtime_mode() != "FULL"
+                or self._active_measurement_type != MeasurementType.KERNEL_ONLY):
+            table.stats["ineligible_runtime"] += 1
+            return original
+        return table.predict(len(batch.requests), effective_tokens, original)
 
     def _get_attn_norm_layer_act_execution_time(self, batch: Batch) -> float:
         if not self._supports_operation("input_layernorm"):
@@ -7231,6 +7275,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "full_graph_decode_attention_profile": getattr(self._config, "full_graph_decode_attention_profile", None),
             "full_graph_decode_attention_max_model_len": getattr(self._config, "full_graph_decode_attention_max_model_len", 0),
             "mixed_prefill_work_preserving_kv": getattr(self._config, "mixed_prefill_work_preserving_kv", False),
+            "compiled_decode_activation_enabled": getattr(self._config, "compiled_decode_activation_enabled", False),
+            "compiled_decode_activation_profile": getattr(self._config, "compiled_decode_activation_profile", None),
+            "compiled_decode_activation_contract_sha256": getattr(self._config, "compiled_decode_activation_contract_sha256", None),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }

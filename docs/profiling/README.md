@@ -242,6 +242,37 @@ bash examples/profiling/smoke_simulator_moe_csv.sh \
   --run-id my_moe_csv_smoke
 ```
 
+## Experimental compiled decode activation overlay
+
+`compiled_decode_activation_enabled` is **off by default**. This narrow experiment
+consumes an operator subset of the native compiled Forward profile, not total
+Forward wall time. The extractor in
+`frontier.execution_time_predictor.compiled_activation_profile` requires compiler
+ATen provenance for exactly SiLU and multiplication, one kernel per model layer,
+all TP ranks, repeated samples, and consistency across multiple KV contexts.
+It uses per-layer kernel sums, taking the maximum across concurrent TP ranks.
+
+To opt in, supply all three predictor flags (prefix each with
+`--random_forrest_execution_time_predictor_config_`):
+
+- `compiled_decode_activation_enabled`
+- `compiled_decode_activation_profile /absolute/path/to/activation_profile.json`
+- `compiled_decode_activation_contract_sha256 <expected-execution-contract-hash>`
+
+The expected contract must describe the serving runtime being simulated; copying
+a hash from an unrelated profile does not establish compatibility. The loader
+checks model dimensions, device key, precision, TP, and graph capture sizes.
+Support is limited to unquantized dense SiLU models, MONOLITHIC PP=1/DP=1,
+non-speculative pure decode, FULL graph, and kernel-only measurements. Exact
+`(active requests, capture tokens)` misses use the original prediction without
+interpolation. Prefill/mixed steps and every other operator remain unchanged.
+No estimator or prediction cache is rewritten. Disable the flag to restore the
+baseline; lookup coverage is exported as `compiled_decode_activation.<pid>.json`.
+
+This is an experimental warm-kernel transfer, not a demonstrated general
+accuracy improvement. CUPTI timing, full-model cache conditions, and uncovered
+shapes remain limitations. Workload A/B evidence is required before adoption.
+
 ## Optional mixed-prefill KV aggregation
 
 `mixed_prefill_work_preserving_kv` is a default-off runtime prediction option,
