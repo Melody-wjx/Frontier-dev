@@ -2637,7 +2637,19 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=True,
         metadata={"help": "Whether to skip CPU overhead modeling."},
     )
-
+    cpu_overhead_ray_comm_policy: str = field(
+        default="charge",
+        metadata={
+            "help": (
+                "Policy for charging the ray_comm CPU overhead component: "
+                "'charge' (default) preserves legacy behavior and always "
+                "bills it; 'auto' is a backward-compatible conservative alias "
+                "for 'charge' because current profiles do not carry evidence "
+                "that a nonzero residual is non-chargeable; 'zero' never "
+                "bills it and is intended for explicit ablations only."
+            )
+        },
+    )
     # Dummy mode configuration for fast testing and development
     enable_dummy_mode: bool = field(
         default=False,

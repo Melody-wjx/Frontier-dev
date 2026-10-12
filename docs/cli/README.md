@@ -222,6 +222,25 @@ Use trace replay when you need shared-prefix or known-arrival behavior.
 | `--random_forrest_execution_time_predictor_config_moe_input_file` | Path to `moe.csv`. Required for MoE non-dummy runs. |
 | `--random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling` | Skip CPU overhead predictor modeling for lightweight CSV smoke runs. |
 | `--random_forrest_execution_time_predictor_config_prediction_ood_policy` | Handling for features outside the profiling range: `clip` (default), `error`, or `warn`. |
+| `--random_forrest_execution_time_predictor_config_cpu_overhead_ray_comm_policy` | Billing policy for the `ray_comm` CPU overhead component: `charge` (default), `auto`, or `zero`. |
+
+`cpu_overhead_ray_comm_policy` controls whether the `ray_comm_time` CPU
+overhead component is billed into every batch execution time. The vLLM replay
+profiling backend derives `ray_comm_time_mean` as an identity residual
+(`step_wall - schedule - prepare_inputs - sampler - process_model_outputs`);
+the name `ray_comm` does not mean that the value disappears when vLLM uses its
+multiprocessing backend. Current runtime-hook profiles construct the replay
+envelope so that this residual is measured non-model EngineCore control-plane
+time. Other replay inputs can contain additional unattributed framework work;
+neither case proves that a nonzero value is double-counted. The default
+`charge` therefore preserves Frontier's historical behavior. `auto` is
+retained as a backward-compatible conservative alias for `charge`; it no
+longer guesses from `scheduling_mode`, source, topology, or PP degree. `zero`
+unconditionally drops the component and is intended only for controlled
+ablations. Because billing occurs after prediction, this policy does not
+invalidate estimator or prediction caches. The configured policy and
+effective decision remain visible via `to_dict()`
+(`cpu_overhead_ray_comm_policy`, `ray_comm_time_zeroed`).
 
 When dummy mode is disabled, Frontier checks the predictor cache. If a needed model is missing, it trains from the configured CSVs and writes the trained estimator into the cache directory.
 

@@ -295,6 +295,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         )
 
         self._prediction_ood_policy = self._resolve_prediction_ood_policy()
+        self._cpu_overhead_ray_comm_policy = (
+            self._resolve_cpu_overhead_ray_comm_policy()
+        )
         self._prediction_domain_stats: Dict[tuple, Dict[str, Any]] = {}
         self._prediction_domain_warning_cache: Set[tuple] = set()
         self._prediction_domain_stats_lock = threading.Lock()
@@ -512,6 +515,54 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 f"{sorted(supported)}, got {policy!r}."
             )
         return policy
+
+    def _resolve_cpu_overhead_ray_comm_policy(self) -> str:
+        policy = str(
+            getattr(
+                getattr(self, "_config", None),
+                "cpu_overhead_ray_comm_policy",
+                "charge",
+            )
+        ).strip().lower()
+        supported = {"auto", "charge", "zero"}
+        if policy not in supported:
+            raise ValueError(
+                "cpu_overhead_ray_comm_policy must be one of "
+                f"{sorted(supported)}, got {policy!r}."
+            )
+        return policy
+
+    def _should_zero_ray_comm_time(self) -> bool:
+        """Effective decision for billing the ray_comm CPU overhead component."""
+        cached = getattr(self, "_ray_comm_time_zeroed", None)
+        if cached is not None:
+            return cached
+
+        policy = getattr(
+            self,
+            "_cpu_overhead_ray_comm_policy",
+            self._resolve_cpu_overhead_ray_comm_policy(),
+        )
+        if policy == "zero":
+            zeroed = True
+        else:
+            # Both native Sarathi/Ray and vLLM replay profiles define this
+            # field as measured or derived unattributed framework/control-
+            # plane time. The name is historical; absence of Ray does not
+            # make a nonzero residual free. Current CSV identity does not
+            # prove double counting, so `auto` must fail closed to charging.
+            zeroed = False
+            if policy == "auto":
+                logger.info(
+                    "cpu_overhead_ray_comm_policy=auto: charging ray_comm_time "
+                    "conservatively. Current CPU-overhead profiles identify "
+                    "the producer but do not prove that a nonzero residual is "
+                    "non-chargeable. Use policy=zero only for an explicit "
+                    "ablation."
+                )
+
+        self._ray_comm_time_zeroed = zeroed
+        return zeroed
 
     def _record_prediction_domain_queries(
         self,
@@ -3063,6 +3114,8 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         # estimator. OOD is added separately to prediction-cache identities.
         model_config = self.to_dict()
         model_config.pop("prediction_ood_policy", None)
+        model_config.pop("cpu_overhead_ray_comm_policy", None)
+        model_config.pop("ray_comm_time_zeroed", None)
         config_str = str(model_config)
 
         if df is None:
@@ -6790,6 +6843,8 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         )
 
     def _get_ray_comm_time(self, batch: Batch) -> float:
+        if self._should_zero_ray_comm_time():
+            return 0.0
         return self._get_cpu_overhead_prediction_or_default("ray_comm_time", batch)
 
     # Phase 2.5: Removed deprecated get_moe_stage_execution_details() method
@@ -6827,6 +6882,12 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "prediction_ood_policy": getattr(
                 self, "_prediction_ood_policy", self._resolve_prediction_ood_policy()
             ),
+            "cpu_overhead_ray_comm_policy": getattr(
+                self,
+                "_cpu_overhead_ray_comm_policy",
+                self._resolve_cpu_overhead_ray_comm_policy(),
+            ),
+            "ray_comm_time_zeroed": self._should_zero_ray_comm_time(),
             "max_batch_size": self._config.prediction_max_batch_size,
             "using_shared_models": self._model_manager is not None,
         }

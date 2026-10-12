@@ -235,6 +235,13 @@ Legacy schema-v1 compatibility:
 
 - Sarathi backend: residual Ray/framework overhead.
 - vLLM replay backend: `step_wall_time - (schedule + prepare_inputs + sampler + process_model_outputs)`.
+  This is an identity residual rather than a separately observed Ray phase,
+  but absence of Ray does not make it free. Runtime-hook profiles deliberately
+  construct the replay envelope so that the residual is measured non-model
+  EngineCore control-plane time. The simulator therefore preserves it by
+  default (`cpu_overhead_ray_comm_policy=charge`); `auto` is a conservative
+  compatibility alias for `charge`, while `zero` is an explicit ablation.
+  See `docs/cli/README.md` for the policy details.
 
 ### Backend and TP policy flags
 
