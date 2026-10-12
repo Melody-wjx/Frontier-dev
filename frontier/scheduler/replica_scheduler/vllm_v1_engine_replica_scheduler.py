@@ -180,6 +180,7 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             self._replica_config, "speculative_decoding_config", None
         )
         self._spec_decode_enabled = is_spec_decode_enabled(self._spec_decode_config)
+        self._validate_boundary_alignment_scope()
         self._spec_method_uses_lookahead_slots = False
         if self._spec_decode_enabled:
             self._spec_method_uses_lookahead_slots = method_uses_lookahead_slots(
@@ -2618,6 +2619,32 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             self._get_kv_accounted_processed_tokens(request),
         )
 
+    def _validate_boundary_alignment_scope(self) -> None:
+        enabled = any(
+            getattr(self._config, name, False)
+            for name in (
+                "align_fcfs_preemption_victim",
+                "align_prefix_cache_computed_tokens",
+                "preserve_skipped_waiting_order",
+            )
+        )
+        if enabled and (
+            self._cluster_type != ClusterType.MONOLITHIC
+            or self._num_stages != 1
+            or self._spec_decode_enabled
+        ):
+            raise ValueError(
+                "Experimental vLLM 0.10.2 boundary alignment requires "
+                "MONOLITHIC, PP=1, non-speculative scheduling."
+            )
+
+    def _prefix_cache_frontier_kwargs(self, request: Request) -> Dict[str, int]:
+        if getattr(self._config, "align_prefix_cache_computed_tokens", False):
+            return {
+                "num_computed_tokens": self._get_kv_accounted_processed_tokens(request)
+            }
+        return {}
+
     def _can_allocate_request(
         self,
         request: Request,
@@ -2644,6 +2671,7 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 request,
                 num_new_tokens,
                 new_computed_blocks=new_computed_blocks,
+                **self._prefix_cache_frontier_kwargs(request),
             )
 
         if reservation is None:
@@ -2703,6 +2731,7 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 request,
                 num_new_tokens,
                 new_computed_blocks=new_computed_blocks,
+                **self._prefix_cache_frontier_kwargs(request),
             )
             if allocated_blocks is None:
                 raise ValueError(
@@ -2978,8 +3007,13 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 f"running_queue_size={len(self._running_requests)}"
             )
 
-            # Select victim for preemption (exclude current request)
-            victim = self._select_preemption_victim(exclude=request)
+            # vLLM FCFS evicts the running tail even when it is the requester.
+            align_fcfs = self._scheduling_policy == "fcfs" and getattr(
+                self._config, "align_fcfs_preemption_victim", False
+            )
+            victim = self._select_preemption_victim(
+                exclude=None if align_fcfs else request
+            )
 
             if victim is None:
                 # No victims available (all other requests have higher priority or no other requests)
@@ -2989,6 +3023,8 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
 
             # Preempt victim and try again
             self._preempt_request(victim, preempted_requests)
+            if victim is request:
+                return False
 
     # ========== Phase 1: RUNNING Requests Scheduling ==========
 
@@ -3590,6 +3626,8 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 waiting_queue = deque(
                     sorted(merged_requests, key=lambda r: (r.priority, r.arrived_at))
                 )
+            elif getattr(self._config, "preserve_skipped_waiting_order", False):
+                waiting_queue.extendleft(reversed(skipped_waiting_requests))
             else:
                 waiting_queue.extend(skipped_waiting_requests)
 

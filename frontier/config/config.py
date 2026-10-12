@@ -491,6 +491,27 @@ class VllmV1SchedulerConfig(BaseReplicaSchedulerConfig):
             "help": "Enable preemption when memory is insufficient for running requests."
         },
     )
+    align_fcfs_preemption_victim: bool = field(
+        default=False,
+        metadata={
+            "help": "Experimental vLLM 0.10.2 FCFS tail preemption, including self. "
+            "MONOLITHIC PP=1 non-speculative only."
+        },
+    )
+    align_prefix_cache_computed_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Experimental KV allocation/cache frontier excludes sampled "
+            "tokens without computed KV. MONOLITHIC PP=1 non-speculative only."
+        },
+    )
+    preserve_skipped_waiting_order: bool = field(
+        default=False,
+        metadata={
+            "help": "Experimental FCFS skipped-request prepend preserving original "
+            "order. MONOLITHIC PP=1 non-speculative only."
+        },
+    )
     enable_chunked_prefill: bool = field(
         default=False,
         metadata={

@@ -676,6 +676,21 @@ Practical implication: Frontier intentionally uses a split interface (`param_mem
 
 ## Development Gates
 
+Experimental scheduler boundary candidates (2026-09-30):
+
+- `VllmV1SchedulerConfig` adds independent default-off
+  `align_fcfs_preemption_victim`, `align_prefix_cache_computed_tokens`, and
+  `preserve_skipped_waiting_order` switches. Scope is MONOLITHIC PP=1,
+  non-speculative; these are pending user acceptance, not new defaults.
+- KV allocation accepts an optional explicit computed frontier, consistently
+  used by preflight, allocation and full-block cache bookkeeping. Legacy callers
+  keep their original accounting. Do not globally change Request token progress.
+- Preserve accepted exact-linear-profile B, existing CPU calibration, and the
+  separate default-off FULL Graph attention experiment during boundary ablations.
+- Boundary tests: `tests/unit/test_vllm_v1_boundary_alignment.py`. The Qwen-only
+  workload trials and actual pre-change dirty-worktree checkpoint are in the
+  parent project's `outputs/result/queue_boundary_trial_20260930/`.
+
 Any new feature, refactor, or module adjustment must pass these gates before delivery:
 
 - Keep the design and implementation modular, structured, integrated with existing code boundaries, and free of hard-coded logic or duplicated local reinventions.

@@ -83,28 +83,49 @@ class KVCacheManager:
         request: Request,
         num_tokens: int,
         new_computed_blocks: Optional[list[KVCacheBlock]] = None,
+        *,
+        num_computed_tokens: Optional[int] = None,
     ) -> int:
         if num_tokens <= 0:
             raise ValueError("num_tokens must be > 0")
 
         computed_blocks = new_computed_blocks or []
-        num_computed_tokens = int(request.num_processed_tokens) + len(
-            computed_blocks
-        ) * self.block_size
+        num_computed_tokens = self._computed_frontier(request, num_computed_tokens)
+        num_computed_tokens += len(computed_blocks) * self.block_size
         num_required_blocks = ceil((num_computed_tokens + num_tokens) / self.block_size)
         current_blocks = self.req_to_blocks[request.id]
         return num_required_blocks - len(current_blocks) - len(computed_blocks)
+
+    @staticmethod
+    def _computed_frontier(request: Request, num_computed_tokens: Optional[int]) -> int:
+        """KV already computed before this allocation, excluding newly hit blocks.
+
+        Legacy callers retain Request.num_processed_tokens accounting. A scheduler
+        with an explicit KV frontier can exclude the just-sampled output token.
+        Prefix-hit blocks are added exactly once by the allocation methods.
+        """
+        frontier = int(
+            request.num_processed_tokens
+            if num_computed_tokens is None
+            else num_computed_tokens
+        )
+        if frontier < 0:
+            raise ValueError("num_computed_tokens must be >= 0")
+        return frontier
 
     def can_allocate_slots(
         self,
         request: Request,
         num_tokens: int,
         new_computed_blocks: Optional[list[KVCacheBlock]] = None,
+        *,
+        num_computed_tokens: Optional[int] = None,
     ) -> bool:
         num_new_blocks = self._get_num_new_blocks_required(
             request,
             num_tokens,
             new_computed_blocks,
+            num_computed_tokens=num_computed_tokens,
         )
         evictable_computed_blocks = sum(
             1 for block in (new_computed_blocks or []) if block.ref_cnt == 0
@@ -118,9 +139,14 @@ class KVCacheManager:
         request: Request,
         num_tokens: int,
         new_computed_blocks: Optional[list[KVCacheBlock]] = None,
+        *,
+        num_computed_tokens: Optional[int] = None,
     ) -> Optional[list[KVCacheBlock]]:
         computed_blocks = list(new_computed_blocks or [])
-        if not self.can_allocate_slots(request, num_tokens, computed_blocks):
+        if not self.can_allocate_slots(
+            request, num_tokens, computed_blocks,
+            num_computed_tokens=num_computed_tokens,
+        ):
             return None
 
         if self.enable_caching:
@@ -134,6 +160,7 @@ class KVCacheManager:
             request,
             num_tokens,
             computed_blocks,
+            num_computed_tokens=num_computed_tokens,
         )
         request_blocks = self.req_to_blocks[request.id]
         request_blocks.extend(computed_blocks)
@@ -150,9 +177,8 @@ class KVCacheManager:
         if not self.enable_caching:
             return new_blocks
 
-        num_computed_tokens = int(request.num_processed_tokens) + len(
-            computed_blocks
-        ) * self.block_size
+        num_computed_tokens = self._computed_frontier(request, num_computed_tokens)
+        num_computed_tokens += len(computed_blocks) * self.block_size
         num_full_blocks = (num_computed_tokens + num_tokens) // self.block_size
         num_cached_blocks = self.num_cached_blocks.get(request.id, len(computed_blocks))
         self.block_pool.cache_full_blocks(

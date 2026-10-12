@@ -320,6 +320,25 @@ identity, exact/interpolated hits, and missing/OOD fallback counts. RF models
 and persistent RF prediction caches are not rewritten by the overlay. Disable
 `full_graph_decode_attention_enabled` (or omit its flag) to recover the legacy
 numerical path; keep the old CSVs and all unrelated settings unchanged.
+
+### Experimental vLLM 0.10.2 scheduler boundary alignment
+
+Three independent, default-off switches are available for MONOLITHIC,
+PP=1, non-speculative scheduling:
+
+| Option (prefix `--vllm_v1_scheduler_config_`) | Behavior when enabled |
+|---|---|
+| `align_fcfs_preemption_victim` | FCFS evicts the running tail, including the requesting request itself; priority policy is unchanged. |
+| `align_prefix_cache_computed_tokens` | Prefix-managed KV preflight, allocation, and full-block cache bookkeeping use the computed-KV frontier, not a sampled output token without KV. Newly hit prefix blocks are counted once. |
+| `preserve_skipped_waiting_order` | FCFS prepends skipped requests in original order instead of moving them behind unexamined waiting requests. |
+
+Enable individually for ablation or together for boundary parity. Unsupported
+PP/disaggregated/speculative configurations reject enabled switches rather than
+silently extending this experiment. Omitting all three flags preserves the old
+numerical path. These switches do not change operator profiles, time prediction,
+CPU calibration, or TTFT definitions. Correcting a boundary does not imply lower
+workload TTFT error when that boundary does not affect admission.
+
 ### Metrics output
 
 | Option | Use |
