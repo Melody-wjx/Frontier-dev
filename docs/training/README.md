@@ -191,6 +191,22 @@ python -m frontier.main \
 
 The profiling smoke scripts in `examples/profiling/` use this path for downstream CSV validation.
 
+### Whole-Forward initialization
+
+With the accepted native whole-Forward predictor, independently initialized
+predictors validate the Forward profile before generating lookup tables. Only
+CPU-overhead lookups are then needed: unused legacy GPU compute/attention tables
+are not generated, and exact-linear overlays are reported as
+`effective=false`, `status=superseded_by_whole_forward`.
+
+This is automatic for that validated path; no additional CLI flag is required.
+Original estimator loading/training, profiling CSV validation, CPU predictions
+and cache identities are preserved. `--origin_profiler` keeps the legacy table
+generation path; shared-manager initialization and dummy mode are unchanged.
+The optimization reduces startup cost and memory, without changing predicted
+latencies or the DES event loop. It does not reduce GPU profiling time and does
+not remove the requirement for the configured legacy CSV inputs.
+
 ## Cache Management
 
 | Setting                               | Default | Use                                      |

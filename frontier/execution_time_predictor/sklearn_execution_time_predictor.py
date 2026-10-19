@@ -436,6 +436,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._predictions_kernel_only: Dict[str, Any] = {}
         self._models = {}
         self._predictions = {}
+        self._serving_forward = None
         self._mtp_secondary_predictors: Dict[str, BaseExecutionTimePredictor] = {}
         self._active_measurement_type = self._get_default_measurement_type_for_cluster()
 
@@ -466,6 +467,12 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
                 if should_load_kernel_only:
                     self._models_kernel_only = self._train_models_for_family(MeasurementType.KERNEL_ONLY)
 
+            if model_manager is None:
+                # Keep the original model/data validation above. Only a fully
+                # validated native Forward profile can make legacy GPU lookup
+                # generation unnecessary; CPU families still use their normal
+                # models, exact rows, hashes and caches.
+                self._load_serving_forward(metrics_config)
             self._predictions_eager = self._predict_from_models_for_family(
                 MeasurementType.CUDA_EVENT, self._models_eager
             )
@@ -503,7 +510,16 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         self._apply_profiled_linear_overrides(metrics_config)
         self._load_full_graph_decode_attention(metrics_config)
         self._load_compiled_decode_activation(metrics_config)
-        self._load_serving_forward(metrics_config)
+        if model_manager is not None or self._enable_dummy_mode:
+            # Shared-manager initialization and dummy-mode behavior are not
+            # changed by the independent whole-Forward lookup optimization.
+            self._load_serving_forward(metrics_config)
+
+    def _uses_serving_forward_cpu_only_lookups(self) -> bool:
+        return (
+            getattr(self, "_serving_forward", None) is not None
+            and getattr(self, "_model_manager", None) is None
+        )
 
     def _load_serving_forward(self, metrics_config) -> None:
         self._serving_forward = None
@@ -654,8 +670,17 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         report = {"enabled": True, "scope": list(LINEAR_OPERATIONS),
                   "model": self._replica_config.model_name,
                   "device": self._replica_config.device, "families": {}}
-        for family, lookup in ((MeasurementType.CUDA_EVENT, self._predictions_eager),
-                               (MeasurementType.KERNEL_ONLY, self._predictions_kernel_only)):
+        cpu_only = self._uses_serving_forward_cpu_only_lookups()
+        families = ((MeasurementType.CUDA_EVENT, self._predictions_eager),
+                    (MeasurementType.KERNEL_ONLY, self._predictions_kernel_only))
+        if cpu_only:
+            report.update(
+                effective=False,
+                status="superseded_by_whole_forward",
+                reason="Whole Forward replaces legacy GPU operator predictions; exact linear overrides are inactive.",
+            )
+            families = ()
+        for family, lookup in families:
             if not lookup:
                 continue
             with self._temporary_measurement_type(family):
@@ -684,7 +709,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         target = Path(metrics_config.output_dir) / f"exact_linear_profile.{self._cluster_type.name}.{os.getpid()}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report, indent=2) + "\n")
-        logger.info("Applied opt-in exact linear medians; original caches unchanged; audit=%s", target)
+        if cpu_only:
+            logger.info("Exact linear overrides inactive under whole Forward; original caches unchanged; audit=%s", target)
+        else:
+            logger.info("Applied opt-in exact linear medians; original caches unchanged; audit=%s", target)
 
     def _resolve_prediction_ood_policy(self) -> str:
         policy = str(
@@ -4686,6 +4714,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         return max_tokens
 
     def _predict_from_models(self) -> Dict[str, Any]:
+        if self._uses_serving_forward_cpu_only_lookups():
+            predictions = self._predict_for_cpu_overhead_models()
+            logger.info(
+                "Generated %d CPU lookup types for validated whole Forward; "
+                "unused legacy GPU lookup generation skipped",
+                len(predictions),
+            )
+            return predictions
         predictions = {}
 
         # Always predict compute models (cluster-specific filtering happens inside)
@@ -8301,7 +8337,8 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         assert num_layers >= 1, f"num_layers must be >= 1, got {num_layers}"
 
         measurement_type = self._select_measurement_type_for_batch(batch)
-        self._require_predictions_for_measurement_type(measurement_type, batch)
+        if not self._uses_serving_forward_cpu_only_lookups():
+            self._require_predictions_for_measurement_type(measurement_type, batch)
         self._activate_measurement_type(measurement_type)
 
         # Calculate first-class communication operators for the dense live path.
